@@ -240,7 +240,7 @@ export const App = () => {
           <Route path="/execution-center" element={<AuthenticatedWorkspace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-        <PwaUpdateNotice />
+        {/* <PwaUpdateNotice /> */}
         <PwaIosPrompt />
       </PwaInstallProvider>
     </TooltipProvider>

@@ -1,3 +1,4 @@
+import { hasPosterDocumentMarker, parsePosterDocument } from "@edgeever/shared";
 import {
   createExcerpt,
   DEFAULT_MEMO_TITLE,
@@ -9,6 +10,8 @@ import {
   resolveMemoContentDoc,
   resolveMergedMemoTitle,
   isSuspiciousMemoOverwrite,
+  SUSPICIOUS_MEMO_OVERWRITE_ERROR,
+  SUSPICIOUS_MEMO_OVERWRITE_MESSAGE,
   isMemoEditBindingValid,
   listTableAttachmentResourceIds,
   normalizeTags,
@@ -22,13 +25,12 @@ import {
 import { auditStatement } from "./audit";
 import type { AppContext, AuditActor, AuthContext, Bindings } from "./api-context";
 import { AppError } from "./app-error";
-import { createId, isoNow, parseJsonArray } from "./entity-utils";
+import { clampNumber, createId, isoNow, parseJsonArray } from "./entity-utils";
 import { workspaceInboxId } from "./notebook-service";
 import { sha256 } from "./hash-utils";
 import { getRequiredString } from "./mcp-json-rpc";
 import {
   escapeLike,
-  listMemos,
   mapMemoSummary,
   toFtsQuery,
   type MemoSummaryRow,
@@ -53,8 +55,6 @@ export type MemoMutationCommit = {
   after: (memoId: string) => PreparedStatementAdapter[];
 };
 
-const clampNumber = (value: number, min: number, max: number) =>
-  Number.isNaN(value) ? min : Math.min(Math.max(value, min), max);
 
 export type MemoDetailRow = MemoSummaryRow & {
   content_json: string;
@@ -170,6 +170,7 @@ export const searchMemoSummaries = async (
     updatedBefore?: string | null;
     isPinned?: boolean | null;
     hasResources?: boolean | null;
+    poster?: boolean | null;
     limit: number;
   }
 ): Promise<MemoSummary[]> => {
@@ -227,6 +228,11 @@ export const searchMemoSummaries = async (
     );
   }
 
+  if (typeof options.poster === "boolean") {
+    filters.push("(instr(c.content_markdown, '<!-- edgeever-poster-v1:') > 0) = ?");
+    binds.push(options.poster ? 1 : 0);
+  }
+
   if (q) {
     const ftsQuery = toFtsQuery(q);
     const likeQuery = `%${escapeLike(q)}%`;
@@ -255,7 +261,7 @@ export const searchMemoSummaries = async (
            )
            SELECT m.id, m.notebook_id, m.title, m.excerpt, m.tags_json, m.is_pinned,
                   m.is_archived, m.is_deleted, m.created_at, m.updated_at, m.deleted_at, c.revision,
-                  c.content_text
+                  c.content_text, (instr(c.content_markdown, '<!-- edgeever-poster-v1:') > 0) AS is_poster
            FROM search_matches s
            INNER JOIN memos m ON m.id = s.memo_id
            INNER JOIN memo_contents c ON c.memo_id = m.id
@@ -274,7 +280,7 @@ export const searchMemoSummaries = async (
     .prepare(
       `SELECT m.id, m.notebook_id, m.title, m.excerpt, m.tags_json, m.is_pinned,
               m.is_archived, m.is_deleted, m.created_at, m.updated_at, m.deleted_at, c.revision,
-              c.content_text
+              c.content_text, (instr(c.content_markdown, '<!-- edgeever-poster-v1:') > 0) AS is_poster
        FROM memos m
        INNER JOIN memo_contents c ON c.memo_id = m.id
        WHERE ${filters.join(" AND ")}
@@ -289,12 +295,15 @@ export const searchMemoSummaries = async (
 
 export const listMemosForMcp = async (
   db: DatabaseAdapter,
-  options: { workspaceId: string; notebookId?: string | null; limit: number; offset: number; includeContent: boolean; includeDeleted: boolean }
+  options: { workspaceId: string; notebookId?: string | null; limit: number; offset: number; includeContent: boolean; includeDeleted: boolean; poster?: boolean | null }
 ) => {
   const notebookId = options.notebookId?.trim() || null;
   const limit = clampNumber(options.limit, 1, 100);
   const offset = clampNumber(options.offset, 0, 100_000);
   const pageSize = limit + 1;
+  const posterFilter = typeof options.poster === "boolean"
+    ? `(instr(c.content_markdown, '<!-- edgeever-poster-v1:') > 0) = ${options.poster ? 1 : 0}`
+    : "1 = 1";
   const deletedFilter = options.includeDeleted ? "1 = 1" : "m.is_deleted = 0";
 
   if (options.includeContent) {
@@ -306,7 +315,7 @@ export const listMemosForMcp = async (
                 m.source_memo_ids, m.merge_source_count, m.merged_into_memo_id
          FROM memos m
          INNER JOIN memo_contents c ON c.memo_id = m.id
-         WHERE m.workspace_id = ? AND ${deletedFilter}
+         WHERE m.workspace_id = ? AND ${deletedFilter} AND ${posterFilter}
            AND (? IS NULL OR m.notebook_id = ?)
          ORDER BY m.updated_at DESC, m.id ASC
          LIMIT ? OFFSET ?`
@@ -328,10 +337,10 @@ export const listMemosForMcp = async (
     .prepare(
       `SELECT m.id, m.notebook_id, m.title, m.excerpt, m.tags_json, m.is_pinned,
               m.is_archived, m.is_deleted, m.created_at, m.updated_at, m.deleted_at, c.revision,
-              c.content_text
+              c.content_text, (instr(c.content_markdown, '<!-- edgeever-poster-v1:') > 0) AS is_poster
        FROM memos m
        INNER JOIN memo_contents c ON c.memo_id = m.id
-       WHERE m.workspace_id = ? AND ${deletedFilter}
+       WHERE m.workspace_id = ? AND ${deletedFilter} AND ${posterFilter}
          AND (? IS NULL OR m.notebook_id = ?)
        ORDER BY m.updated_at DESC, m.id ASC
        LIMIT ? OFFSET ?`
@@ -948,6 +957,12 @@ export const createMemoRecord = async (
   actor: { actorType: "user" | "agent"; actorId: string | null },
   actorLabel: string
 ): Promise<MemoDetail> => {
+  // Reject a missing notebook before the batch. The memo insert is a SELECT
+  // from notebooks, so a bad id used to write orphan content and then fail
+  // the read-back as a generic 500.
+  if (!(await getNotebook(db, workspaceId, input.notebookId))) {
+    throw new AppError("not_found", "Notebook not found", 404);
+  }
   const tags = normalizeTags(input.tags);
   const contentMarkdown = input.contentMarkdown ?? "";
   const contentJson = input.contentJson && typeof input.contentJson === "object"
@@ -1335,13 +1350,19 @@ export const updateMemoRecord = async (
     isSuspiciousMemoOverwrite(current.title, current.content_text, title, contentText)
   ) {
     return {
-      error: "suspicious_memo_overwrite",
-      message: "Save blocked because the title changed while most of the note content disappeared.",
+      error: SUSPICIOUS_MEMO_OVERWRITE_ERROR,
+      message: SUSPICIOUS_MEMO_OVERWRITE_MESSAGE,
     };
   }
   const tags = input.tags === undefined ? parseJsonArray(current.tags_json) : normalizeTags(input.tags);
   const excerpt = createExcerpt(contentText);
   const notebookId = input.notebookId ?? current.notebook_id;
+  if (hasPosterDocumentMarker(current.content_markdown) && !parsePosterDocument(contentMarkdown)) {
+    return { error: "poster_update_required", message: "Poster source must be edited on a supported client.", status: 409 };
+  }
+  if (hasPosterDocumentMarker(contentMarkdown) && !parsePosterDocument(contentMarkdown)) {
+    return { error: "invalid_poster", message: "Invalid poster source.", status: 400 };
+  }
   const currentTable = parseTableDocument(current.content_markdown);
   const nextTable = parseTableDocument(contentMarkdown);
   if (currentTable && !nextTable) {

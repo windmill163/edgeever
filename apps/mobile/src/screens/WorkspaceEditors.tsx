@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
 import { File as ExpoFile } from "expo-file-system";
-import { ActivityIndicator, Check, ChevronDown, ChevronLeft, RotateCcw } from "../components/icons";
+import { ActivityIndicator, ChevronDown, ChevronLeft, RotateCcw } from "../components/icons";
 import { BackHandler, KeyboardAvoidingView, Platform, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Alert, Pressable, Text, TextInput } from "../components/LocalizedText";
@@ -28,7 +28,7 @@ import { queueMobileMemoCreate, queueMobileMemoUpdate } from "../lib/sync-queue"
 import { createMobileDataScope, upsertLocalMemo } from "../lib/local-mirror";
 import { recordEditorStartup } from "../lib/startup-performance";
 import { prepareUploadAsset, type MobileImageUploadAsset } from "../lib/mobile-image-upload";
-import MobileWebClipCapture from "../components/MobileWebClipCapture";
+import { uploadMobileResource } from "../lib/mobile-resource-upload";
 import LocalTiptapEditor, { type LocalTiptapEditorRef } from "../components/LocalTiptapEditor";
 import { SAFE_DOM_WEBVIEW_PROPS } from "../lib/mobile-dom";
 import { safeDomCall } from "../lib/safe-dom-call";
@@ -51,9 +51,6 @@ import { createOptimisticMemo, type MobileMemoUpdatePayload } from "./workspace-
 import { styles } from "./workspace-styles";
 import { NotebookPickerModal, SmartTagButton, TagPickerModal } from "./WorkspacePickers";
 import {
-  deleteMobileResourceFromDoc,
-  getMobileResourceUpdatePayload,
-  renameMobileResourceInDoc,
   type MobileResourceTarget,
 } from "../lib/mobile-attachments";
 import {
@@ -126,17 +123,17 @@ const resolveEditableMemoTitle = (title?: string | null) => {
 };
 
 const alertProtectedImageLoadFailure = (
-  locale: "zh-CN" | "en-US" | "ja",
+  locale: "zh-CN" | "en-US" | "ja" | "pl",
   failure: ProtectedResourceLoadFailure
 ) => {
   const statusLabel = failure.status != null
     ? String(failure.status)
-    : locale === "en-US"
+    : locale !== "zh-CN"
       ? "network error"
       : "网络错误";
   Alert.alert(
     locale !== "zh-CN" ? "Image failed to load" : "图片加载失败",
-    locale === "en-US"
+    locale !== "zh-CN"
       ? `Could not load a note image (${statusLabel}). Check the network and try again.`
       : `笔记中的图片未能加载（${statusLabel}）。请检查网络后重试。`
   );
@@ -147,12 +144,12 @@ export const CreateMemoModal = ({
   client: clientProp,
   dataScope,
   defaultNotebookId,
+  finishForIncomingShare = false,
   imageCompressionEnabled,
   initialDraft,
   initialSharedImages = [],
   notebooks,
   onCreated,
-  onDismiss,
   onQueued,
   syncQueueScope,
 }: {
@@ -160,6 +157,7 @@ export const CreateMemoModal = ({
   client?: ReturnType<typeof useSession>["client"];
   dataScope: string;
   defaultNotebookId: string;
+  finishForIncomingShare?: boolean;
   imageCompressionEnabled: boolean;
   initialDraft?: MobileCreateMemoSeed | MobileWebClipDraft | null;
   initialSharedImages?: MobileSharedImage[];
@@ -204,6 +202,9 @@ export const CreateMemoModal = ({
   const [imageOperation, setImageOperation] = useState<"idle" | "creating" | "uploading">("idle");
   const imageOperationRef = useRef(imageOperation);
   const sharedImagesHandledRef = useRef(false);
+  const [importingSharedImages, setImportingSharedImages] = useState(initialSharedImages.length > 0);
+  const [sharedImageImportFailed, setSharedImageImportFailed] = useState(false);
+  const shareHandoffStartedRef = useRef(false);
   const createPendingRef = useRef(false);
   const submitStartedRef = useRef(false);
   const [submitStarted, setSubmitStarted] = useState(false);
@@ -533,7 +534,7 @@ export const CreateMemoModal = ({
       const memo = await materializeMemoForImage();
       setImageOperation("uploading");
       const uploadAsset = await prepareUploadAsset(asset, imageCompressionEnabled);
-      const { resource } = await client!.uploadMemoResource(memo.id, new ExpoFile(uploadAsset.uri));
+      const { resource } = await uploadMobileResource(client!, memo.id, uploadAsset);
       applyMobileEditorUpload(editorRef, resource, uploadId, uploadAsset.name || (resource.kind === "image" ? "图片" : "附件"));
       if (resource.kind === "image" && !keepBusy) {
         safeDomCall(() => editorRef.current?.finishImageBatch([resource.url]));
@@ -570,8 +571,14 @@ export const CreateMemoModal = ({
     }
     sharedImagesHandledRef.current = true;
     void (async () => {
-      for (const image of initialSharedImages) {
-        await uploadImageAsset(image);
+      try {
+        for (const image of initialSharedImages) {
+          if (await uploadImageAsset(image) === undefined) {
+            setSharedImageImportFailed(true);
+          }
+        }
+      } finally {
+        setImportingSharedImages(false);
       }
     })();
   }, [editorReady, initialSharedImages]);
@@ -606,6 +613,21 @@ export const CreateMemoModal = ({
   };
 
   const requestClose = () => submitCreateMemo();
+
+  useEffect(() => {
+    if (!finishForIncomingShare) {
+      shareHandoffStartedRef.current = false;
+      return;
+    }
+    if (!draftLoaded || !editorReady || importingSharedImages || sharedImageImportFailed || imageOperation !== "idle" || submitStarted || shareHandoffStartedRef.current) {
+      return;
+    }
+    // Save through the normal close path, including editor flush and queued
+    // writes. On failure keep both this editor and the next share intact;
+    // the user can retry saving without an automatic retry loop.
+    shareHandoffStartedRef.current = true;
+    void submitCreateMemo();
+  }, [finishForIncomingShare, draftLoaded, editorReady, importingSharedImages, sharedImageImportFailed, imageOperation, submitStarted, submitCreateMemo]);
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -1029,7 +1051,7 @@ export const RichEditorModal = ({
           safeDomCall(() => editorRef.current?.beginImageUpload(uploadId, previewDataUrl));
         }
         const uploadAsset = await prepareUploadAsset(asset, imageCompressionEnabled);
-        const { resource } = await client.uploadMemoResource(memo.id, new ExpoFile(uploadAsset.uri));
+        const { resource } = await uploadMobileResource(client, memo.id, uploadAsset);
         applyMobileEditorUpload(editorRef, resource, uploadId, uploadAsset.name || (resource.kind === "image" ? "图片" : "附件"));
         if (resource.kind === "image") sources.push(resource.url);
         uploadId = null;
@@ -1267,19 +1289,4 @@ const createLocalImagePreviewDataUrl = async (asset: { mimeType?: string | null;
   const file = new ExpoFile(asset.uri);
   const mimeType = asset.mimeType || file.type || "application/octet-stream";
   return `data:${mimeType};base64,${await file.base64()}`;
-};
-
-const appendResourceMarkdown = (
-  currentMarkdown: string,
-  resource: {
-    filename: string;
-    kind: "image" | "attachment";
-    url: string;
-  }
-) => {
-  const label = resource.filename.replace(/\]/g, "\\]");
-  const markdown = resource.kind === "image" ? `![${label}](${resource.url})` : `附件：[${label}](${resource.url})`;
-  const trimmed = currentMarkdown.trimEnd();
-
-  return trimmed ? `${trimmed}\n\n${markdown}\n` : `${markdown}\n`;
 };

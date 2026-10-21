@@ -1,9 +1,14 @@
+import { requestPosterRender, readPosterRenderJob, posterRenderJob } from "./poster-render-service";
+import { applyPosterEdits, compilePosterMemo, posterCapabilities } from "./mcp-poster-tools";
+import { resolveObjectStorage } from "./object-storage";
+import { hasPosterDocumentMarker, parsePosterDocument, serializePosterDocument } from "@edgeever/shared";
 import {
   AiPromptTemplateCreateSchema,
   AiPromptTemplateUpdateSchema,
   TemplateCreateSchema,
   TemplateUpdateSchema,
   compileInfographicNote,
+  DIAGRAM_DEFAULT_THEME,
   docToText,
   hasInfographicDocumentMarker,
   INFOGRAPHIC_SCHEMA_VERSION,
@@ -39,6 +44,7 @@ import { isDemoModeEnabled } from "./demo-mode";
 import { createId, isoNow } from "./entity-utils";
 import {
   decodeBase64Data,
+  encodeBase64Data,
   escapeMarkdownImageAlt,
   escapeMarkdownLinkLabel,
   getOptionalString,
@@ -70,6 +76,7 @@ import {
 } from "./memo-revision-service";
 import {
   createNotebookRecord,
+  deleteNotebookTree,
   findNotebooks,
   getNotebook,
   listNotebooks,
@@ -79,6 +86,8 @@ import {
 import {
     createAttachmentResource,
     createImageResource,
+    getResourceRow,
+    mapResource,
     inferImageExtension,
     listResourcesForMcp,
     listResourcesForMemo,
@@ -160,6 +169,7 @@ export type McpToolDependencies = {
       offset: number;
       includeContent: boolean;
       includeDeleted: boolean;
+      poster?: boolean | null;
     },
   ) => Promise<unknown>;
   mergeMemosRecord: (
@@ -196,6 +206,7 @@ export type McpToolDependencies = {
       updatedBefore?: string | null;
       isPinned?: boolean | null;
       hasResources?: boolean | null;
+      poster?: boolean | null;
       limit: number;
     },
   ) => Promise<MemoSummary[]>;
@@ -278,6 +289,7 @@ export const callMcpTool = async (
           updatedAfter: getOptionalString(args.updatedAfter),
           updatedBefore: getOptionalString(args.updatedBefore),
           isPinned: typeof args.isPinned === "boolean" ? args.isPinned : null,
+          poster: typeof args.poster === "boolean" ? args.poster : null,
           hasResources: typeof args.hasResources === "boolean" ? args.hasResources : null,
           limit: clampNumber(Number(args.limit ?? 20), 1, 50),
         }),
@@ -292,6 +304,7 @@ export const callMcpTool = async (
         offset: clampNumber(Number(args.offset ?? 0), 0, 100_000),
         includeContent: args.includeContent === true,
         includeDeleted: args.includeDeleted === true,
+        poster: typeof args.poster === "boolean" ? args.poster : null,
       });
     }
     case "get_memo": {
@@ -484,7 +497,11 @@ export const callMcpTool = async (
       const notebookId = getRequiredString(args.notebookId, "notebookId");
       const ir = parseDiagramMemoIr(args);
       const { compileDiagramIr } = await import("@edgeever/shared/diagram-layout");
-      const document = compileDiagramIr(ir);
+      // Generated mind maps and flowcharts start with the editor's default
+      // theme even when an agent supplies an arbitrary color scheme.
+      const document = compileDiagramIr(ir.kind === "mind-map" || ir.kind === "flowchart"
+        ? { ...ir, theme: DIAGRAM_DEFAULT_THEME }
+        : ir);
       const contentMarkdown = serializeDiagramDocument(document);
       if (!parseDiagramDocument(contentMarkdown)) {
         throw new AppError("invalid_params", "The diagram graph could not be compiled", 400);
@@ -501,6 +518,94 @@ export const callMcpTool = async (
         diagramKind: document.kind,
         diagram: diagramSemanticGraph(document),
       };
+    }
+    case "create_poster_memo": {
+      assertScope(auth, "write:memos");
+      const { args: input, document } = compilePosterMemo(args);
+      const memo = await createMemoRecord(c.env.storage.db, auth.workspaceId, {
+        notebookId: input.notebookId, title: input.title,
+        contentMarkdown: serializePosterDocument(document), tags: input.tags,
+      }, getAuditActor(c), getActorLabel(c));
+      return { memo: { id: memo.id, title: memo.title, notebookId: memo.notebookId, revision: memo.revision }, poster: true, template: input.template, format: input.format };
+    }
+    case "request_poster_render": {
+      assertScope(auth, "write:memos");
+      assertScope(auth, "write:resources");
+      return requestPosterRender(c.env.storage.db, auth.workspaceId, getRequiredString(args.memoId, "memoId"), args.expectedRevision as number, getOptionalString(args.templateId) ?? undefined);
+    }
+    case "get_poster_render_job": {
+      assertScope(auth, "read:memos");
+      const row = await readPosterRenderJob(c.env.storage.db, auth.workspaceId, getRequiredString(args.jobId, "jobId"));
+      if (!row) throw new AppError("not_found", "Render task not found", 404);
+      return posterRenderJob(row);
+    }
+    case "get_poster_capabilities": {
+      assertScope(auth, "read:memos");
+      return posterCapabilities();
+    }
+    case "get_poster_preview":
+    case "export_poster": {
+      assertScope(auth, "read:memos");
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, getRequiredString(args.memoId, "memoId"));
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      const poster = parsePosterDocument(memo.contentMarkdown);
+      if (!poster) throw new AppError("not_poster", "Memo is not an editable poster", 400);
+      if (name === "export_poster" && args.format === "source") {
+        return { memoId: memo.id, revision: memo.revision, filename: `${(memo.title || "poster").replace(/[\\/:*?"<>|]/g, "_")}.json`, mimeType: "application/json", content: JSON.stringify(poster, null, 2) };
+      }
+      if (name === "export_poster" && args.format !== "saved_preview") throw new AppError("invalid_params", "Choose source or saved_preview", 400);
+      assertScope(auth, "read:resources");
+      const row = poster.previewResourceId ? await getResourceRow(c.env.storage.db, auth.workspaceId, poster.previewResourceId) : null;
+      if (!row || row.memo_id !== memo.id || row.kind !== "image") {
+        const unavailable = { available: false, memoId: memo.id, revision: memo.revision, reason: "browser_render_required", message: "No current rendered preview. Call request_poster_render with this revision and wait for an online desktop/Web workspace, or open and save the poster editor. Never present source or an old image as a current preview." };
+        if (name === "export_poster") throw new AppError("preview_unavailable", unavailable.message, 409);
+        return unavailable;
+      }
+      if (!["image/png", "image/jpeg", "image/webp"].includes(row.mime_type ?? "")) throw new AppError("preview_unavailable", "Preview is not a supported rendered image", 409);
+      const maxPreviewBytes = 4 * 1024 * 1024;
+      if (row.byte_size > maxPreviewBytes) throw new AppError("preview_too_large", "Preview exceeds 4 MiB. Export through the browser editor.", 413);
+      const storage = await resolveObjectStorage(c.env, row.storage_config_id);
+      const object = await storage.store.get(row.object_key);
+      if (!object) throw new AppError("preview_unavailable", "The preview image file is missing", 409);
+      if (object.size > maxPreviewBytes) {
+        await object.body.cancel();
+        throw new AppError("preview_too_large", "Preview exceeds 4 MiB. Export through the browser editor.", 413);
+      }
+      const bytes = new Uint8Array(await new Response(object.body).arrayBuffer());
+      if (!bytes.length || bytes.length > maxPreviewBytes) throw new AppError("preview_unavailable", "Invalid preview image size", 409);
+      return { available: true, memoId: memo.id, revision: memo.revision, resource: mapResource(row), renderer: "browser", image: { data: encodeBase64Data(bytes), mimeType: row.mime_type! } };
+    }
+    case "get_poster": {
+      assertScope(auth, "read:memos");
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, getRequiredString(args.memoId, "memoId"));
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      const poster = parsePosterDocument(memo.contentMarkdown);
+      if (!poster) throw new AppError("not_poster", "Memo is not an editable poster", 400);
+      return { memo: { id: memo.id, title: memo.title, notebookId: memo.notebookId, revision: memo.revision }, poster };
+    }
+    case "update_poster": {
+      assertScope(auth, "write:memos");
+      const memoId = getRequiredString(args.memoId, "memoId");
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      if (memo.revision !== args.expectedRevision) throw new AppError("revision_conflict", "Poster changed. Read it again before editing.", 409);
+      const current = parsePosterDocument(memo.contentMarkdown);
+      if (!current) throw new AppError("not_poster", "Memo is not an editable poster", 400);
+      const mutation = applyPosterEdits(args, current);
+      const images = mutation.document.elements.filter(element => element.type === "image");
+      if (images.length) {
+        const owned = new Set((await listResourcesForMemo(c.env.storage.db, auth.workspaceId, memo.id))
+          .filter(resource => resource.kind === "image").map(resource => resource.id));
+        if (images.some(image => !owned.has(image.resourceId))) {
+          throw new AppError("invalid_params", "Poster images must be active image resources belonging to this memo", 400);
+        }
+      }
+      if (args.dryRun === true || !mutation.changed) return { dryRun: args.dryRun === true, memo, poster: mutation.document, changed: mutation.changed };
+      const result = await updateMemoRecord(c.env.storage.db, auth.workspaceId, memoId, {
+        expectedRevision: args.expectedRevision, contentMarkdown: serializePosterDocument(mutation.document),
+      }, getAuditActor(c), getActorLabel(c));
+      if (result.error !== undefined) throw new AppError(result.error, result.message, result.status ?? 400);
+      return { memo: result.memo, poster: mutation.document, changed: true };
     }
     case "get_diagram": {
       assertScope(auth, "read:memos");
@@ -578,6 +683,9 @@ export const callMcpTool = async (
             "Structured table content cannot be replaced through update_memo.",
             400,
           );
+        }
+        if (existing && hasPosterDocumentMarker(existing.contentMarkdown)) {
+          throw new AppError("poster_update_required", "Poster content cannot be replaced through update_memo. Use get_poster then update_poster.", 400);
         }
         if (existing && hasInfographicDocumentMarker(existing.contentMarkdown)) {
           throw new AppError(
@@ -843,6 +951,18 @@ export const callMcpTool = async (
       );
 
       return { notebook };
+    }
+    case "delete_notebook": {
+      assertScope(auth, "write:notebooks");
+      if (Object.keys(args).some((key) => key !== "notebookId" && key !== "dryRun")) {
+        throw new AppError("invalid_params", "Only notebookId and dryRun are supported; recursive note deletion is not available", 400);
+      }
+      if (args.dryRun !== undefined && typeof args.dryRun !== "boolean") {
+        throw new AppError("invalid_params", "dryRun must be a boolean", 400);
+      }
+      return deleteNotebookTree(c.env.storage.db, auth.workspaceId,
+        getRequiredString(args.notebookId, "notebookId"), getAuditActor(c),
+        { dryRun: args.dryRun === true, guardConcurrentChanges: true });
     }
     case "create_notebook": {
       assertScope(auth, "write:notebooks");

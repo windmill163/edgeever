@@ -7,6 +7,7 @@ const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator
 const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
 const originalClipboardItem = Object.getOwnPropertyDescriptor(globalThis, "ClipboardItem");
 const originalURL = Object.getOwnPropertyDescriptor(globalThis, "URL");
+const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
 
 const restoreGlobal = (name, descriptor) => {
   if (descriptor) {
@@ -22,6 +23,7 @@ afterEach(() => {
   restoreGlobal("document", originalDocument);
   restoreGlobal("ClipboardItem", originalClipboardItem);
   restoreGlobal("URL", originalURL);
+  restoreGlobal("fetch", originalFetch);
 });
 
 describe("copyTextToClipboard", () => {
@@ -113,6 +115,37 @@ const installClipboardItem = () => {
 };
 
 describe("copyImageBlobToClipboard", () => {
+  test("finishes a failed JPEG conversion and releases the large canvas", async () => {
+    for (const failure of ["context", "draw", "encode"]) {
+      const revoked = [];
+      const canvas = {
+        width: 0,
+        height: 0,
+        getContext: () => failure === "context" ? null : {
+          drawImage() { if (failure === "draw") throw new Error("Canvas allocation failed"); },
+        },
+        toBlob() { throw new Error("PNG encoding failed"); },
+      };
+      const image = {
+        naturalWidth: 1600,
+        naturalHeight: 42000,
+        set src(_value) { queueMicrotask(() => image.onload?.()); },
+      };
+      globalThis.window = {};
+      installClipboardItem();
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { clipboard: { write: async items => { await items[0].data["image/png"]; } } },
+      });
+      globalThis.document = { createElement: tag => tag === "img" ? image : canvas };
+      globalThis.URL = { createObjectURL: () => "blob:large-jpeg", revokeObjectURL: url => revoked.push(url) };
+      await expect(copyImageBlobToClipboard(new Blob([Uint8Array.from([1])], { type: "image/jpeg" }))).resolves.toBe(false);
+      expect(canvas.width).toBe(0);
+      expect(canvas.height).toBe(0);
+      expect(revoked).toEqual(["blob:large-jpeg"]);
+    }
+  });
+
   test("uses the native image clipboard bridge in the desktop app", async () => {
     const calls = [];
     const png = new Blob([Uint8Array.from([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });

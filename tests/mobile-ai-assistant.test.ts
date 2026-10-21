@@ -61,7 +61,7 @@ describe("native mobile AI note assistant", () => {
     expect(iosAssistantSource).toContain("promptId: selectedPrompt?.id");
     expect(iosApiSource).toContain('path: "/api/v1/ai/generate/prepare"');
     expect(iosApiSource).toContain("streamDirectProvider");
-    expect(iosApiSource).toContain('makeURL(path: "/api/v1/ai/generate")');
+    expect(iosApiSource).not.toContain('makeURL(path: "/api/v1/ai/generate")');
     expect(iosApiSource).toContain("for try await line in bytes.lines");
   });
 
@@ -82,7 +82,7 @@ describe("native mobile AI note assistant", () => {
     expect(androidDetailSource).toContain('label={resolvedLocale !== "zh-CN" ? "AI note assistant" : "AI 笔记助手"}');
     expect(androidDetailSource).toContain("setAiAssistantOpen(true)");
     expect(androidDetailSource).toContain("<MobileAiAssistantModal");
-    expect(iosDetailSource).toContain('env.preferences.t("AI 笔记助手", en: "AI note assistant")');
+    expect(iosDetailSource).toContain('env.preferences.t("AI 笔记助手", en: "AI note assistant"');
     expect(iosDetailSource).toContain("AiAssistantSheet(memo: memo)");
   });
 
@@ -92,7 +92,7 @@ describe("native mobile AI note assistant", () => {
     expect(androidWorkspaceSource).toContain("currentTags: selectedTags");
     expect(androidWorkspaceSource).toContain("onChange(Array.from(new Set([...selectedTags, ...additions])).slice(0, 24))");
 
-    expect(iosApiSource).toContain('path: "/api/v1/ai/tag-suggestions"');
+    expect(iosApiSource).toContain('path: "/api/v1/ai/tag-suggestions/prepare"');
     expect(iosEditorSource).toContain("env.session.client.suggestAiTags(input)");
     expect(iosEditorSource).toContain("contentMarkdown: contentMarkdown");
     expect(iosEditorSource).toContain("currentTags: currentTags");

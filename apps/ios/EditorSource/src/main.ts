@@ -1,3 +1,5 @@
+import { prepareNoteImageAssets } from "@edgeever/shared/note-image-fonts";
+import { noteImageAssetUrls } from "@edgeever/shared/note-image-assets";
 import "./styles.css";
 import "katex/dist/katex.min.css";
 import { Graph } from "@antv/x6";
@@ -29,7 +31,7 @@ import {
   type TiptapDoc,
   type DiagramDocument,
 } from "@edgeever/shared";
-import { clearMobileEditorUndoHistory } from "@edgeever/shared/mobile-editor";
+import { clearMobileEditorUndoHistory, type MobileEditorLocale } from "@edgeever/shared/mobile-editor";
 import {
   type NoteImageTheme,
   type NoteImageFontStyle,
@@ -42,6 +44,8 @@ import {
   buildImageExportBasename,
   buildNoteImageCardMarkup,
   generateCardCss,
+  prepareNoteImageContent,
+  planNativeNoteImageRender,
 } from "@edgeever/shared/note-image-card";
 import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
 import { createIosImageGallery } from "./document-nodes";
@@ -68,9 +72,13 @@ type BridgeMessage =
   | { type: "doubleTap" }
   | { type: "pickImage" }
   | { type: "searchResult"; count: number; index: number }
+  | { type: "readerScroll"; collapsed: boolean }
+  | { type: "imageExportFontStatus"; requestId: string; status: "loading" | "fallback" | "ready" }
+  | { type: "imageExportFontsReady"; requestId: string }
   | { type: "imageExportChunk"; requestId: string; chunk: string }
   | {
       type: "imageExportComplete";
+      fontFallback: boolean;
       requestId: string;
       filename: string;
       mimeType: string;
@@ -183,7 +191,7 @@ type ImageExportRequest = {
   branding?: boolean;
 };
 let mode: "viewer" | "editor" = "viewer";
-let locale: "zh-CN" | "en-US" = "zh-CN";
+let locale: MobileEditorLocale = "zh-CN";
 let currentPlaceholder = "开始输入…";
 let suppressChange = false;
 const resourceResolvers = new Map<string, (dataUrl: string | null) => void>();
@@ -277,6 +285,7 @@ async function renderMermaidBlocks(root: HTMLElement, theme: "light" | "dark") {
     startOnLoad: false,
     securityLevel: "strict",
     theme: theme === "dark" ? "dark" : "default",
+    flowchart: { nodeSpacing: 25, rankSpacing: 30 },
   });
 
   let i = 0;
@@ -289,6 +298,13 @@ async function renderMermaidBlocks(root: HTMLElement, theme: "light" | "dark") {
       const wrap = document.createElement("div");
       wrap.className = "edgeever-mermaid";
       wrap.innerHTML = svg;
+      const renderedSvg = wrap.querySelector("svg");
+      const viewBox = renderedSvg?.viewBox.baseVal;
+      if (renderedSvg && viewBox && viewBox.width > 0 && viewBox.height > 0) {
+        renderedSvg.style.width = `${Math.ceil(viewBox.width)}px`;
+        renderedSvg.style.height = `${Math.ceil(viewBox.height)}px`;
+        renderedSvg.style.maxWidth = "none";
+      }
       pre.replaceWith(wrap);
     } catch {
       // leave code block as-is
@@ -774,6 +790,22 @@ function buildExtensions(placeholder: string) {
 
 const editorEl = document.getElementById("editor")!;
 const toolbarEl = document.getElementById("toolbar")!;
+let readerCollapsed = false;
+
+editorEl.addEventListener("scroll", () => {
+  if (mode !== "viewer") return;
+  const collapsed = editorEl.scrollTop > (readerCollapsed ? 4 : 24);
+  if (collapsed === readerCollapsed) return;
+  readerCollapsed = collapsed;
+  post({ type: "readerScroll", collapsed });
+}, { passive: true });
+
+function resetReaderScroll() {
+  if (mode !== "viewer") return;
+  editorEl.scrollTop = 0;
+  readerCollapsed = false;
+  post({ type: "readerScroll", collapsed: false });
+}
 
 const editor = new Editor({
   element: editorEl,
@@ -1161,19 +1193,19 @@ function setToolbarVisible(visible: boolean) {
     btn.type = "button";
     btn.textContent = action.label;
     btn.dataset.action = action.id;
-    const labels: Record<string, [string, string]> = {
-      undo: ["撤销", "Undo"],
-      redo: ["重做", "Redo"],
-      image: ["插入图片", "Insert image"],
-      bold: ["粗体", "Bold"],
-      bullet: ["项目符号列表", "Bullet list"],
-      task: ["任务清单", "Task list"],
-      indent: ["增加列表缩进", "Increase list indent"],
-      outdent: ["减少列表缩进", "Decrease list indent"],
-      quote: ["引用", "Block quote"],
-      hr: ["分隔线", "Horizontal rule"],
+    const labels: Record<string, Record<MobileEditorLocale, string>> = {
+      undo: { "zh-CN": "撤销", "en-US": "Undo", ja: "元に戻す", pl: "Cofnij" },
+      redo: { "zh-CN": "重做", "en-US": "Redo", ja: "やり直す", pl: "Ponów" },
+      image: { "zh-CN": "插入图片", "en-US": "Insert image", ja: "画像を挿入", pl: "Wstaw obraz" },
+      bold: { "zh-CN": "粗体", "en-US": "Bold", ja: "太字", pl: "Pogrubienie" },
+      bullet: { "zh-CN": "项目符号列表", "en-US": "Bullet list", ja: "箇条書き", pl: "Lista punktowana" },
+      task: { "zh-CN": "任务清单", "en-US": "Task list", ja: "タスクリスト", pl: "Lista zadań" },
+      indent: { "zh-CN": "增加列表缩进", "en-US": "Increase list indent", ja: "リストのインデントを増やす", pl: "Zwiększ wcięcie listy" },
+      outdent: { "zh-CN": "减少列表缩进", "en-US": "Decrease list indent", ja: "リストのインデントを減らす", pl: "Zmniejsz wcięcie listy" },
+      quote: { "zh-CN": "引用", "en-US": "Block quote", ja: "引用", pl: "Cytat" },
+      hr: { "zh-CN": "分隔线", "en-US": "Horizontal rule", ja: "区切り線", pl: "Linia pozioma" },
     };
-    btn.setAttribute("aria-label", labels[action.id]?.[locale === "en-US" ? 1 : 0] ?? action.id);
+    btn.setAttribute("aria-label", labels[action.id]?.[locale] ?? action.id);
     btn.addEventListener("click", () => {
       action.run();
       if (action.id !== "image") emitChange(editor);
@@ -1226,11 +1258,11 @@ async function afterContentSet(theme: "light" | "dark" = "light") {
 async function exportNoteImage(request: ImageExportRequest) {
   if (!request.requestId || (request.format !== "png" && request.format !== "jpeg")) return;
   const resolvedTheme = resolveTheme(request.background, request.theme);
-  const fontStyle = request.fontStyle ?? "serif";
+  const fontStyle = request.fontStyle ?? "auto";
   const fontSize = request.fontSize ?? "lg";
-  const cardWidth = request.cardWidth ?? "standard";
-  const targetWidth = NOTE_IMAGE_CARD_WIDTH_PIXELS[cardWidth] || 680;
-  const themeCfg = NOTE_IMAGE_THEMES[resolvedTheme] || NOTE_IMAGE_THEMES.slate;
+  const cardWidth = request.cardWidth ?? "wide";
+  const targetWidth = NOTE_IMAGE_CARD_WIDTH_PIXELS[cardWidth] || NOTE_IMAGE_CARD_WIDTH_PIXELS.wide;
+  const themeCfg = NOTE_IMAGE_THEMES[resolvedTheme] || NOTE_IMAGE_THEMES.aurora;
 
   const editorClone = editor.view.dom.cloneNode(true) as HTMLElement;
   editorClone.removeAttribute("contenteditable");
@@ -1239,6 +1271,7 @@ async function exportNoteImage(request: ImageExportRequest) {
     if (element instanceof HTMLButtonElement) element.remove();
   });
 
+  prepareNoteImageContent(editorClone);
   const bodyHtml = editorClone.innerHTML;
 
   const host = document.createElement("div");
@@ -1254,7 +1287,7 @@ async function exportNoteImage(request: ImageExportRequest) {
     bodyHtml,
     theme: resolvedTheme,
     fontStyle,
-    showTitle: request.showTitle ?? true,
+    showTitle: request.showTitle ?? false,
     showNotebook: request.showNotebook ?? false,
     showTags: request.showTags ?? false,
     showUpdatedAt: request.showUpdatedAt ?? true,
@@ -1271,26 +1304,80 @@ async function exportNoteImage(request: ImageExportRequest) {
   document.body.appendChild(host);
 
   try {
-    await document.fonts?.ready;
-    await Promise.all(Array.from(documentRoot.querySelectorAll("img")).map(async (image) => {
-      if (image.complete) return;
-      try { await image.decode(); } catch { /* Export the readable remainder. */ }
-    }));
+    post({ type: "imageExportFontStatus", requestId: request.requestId, status: "loading" });
+    const assets = await prepareNoteImageAssets({ theme: resolvedTheme, fontStyle, text: [request.title, request.notebook, ...(request.tags || []), request.updatedAt, bodyHtml].join(" "), urls: noteImageAssetUrls });
+    post({ type: "imageExportFontStatus", requestId: request.requestId, status: assets.fontFallback ? "fallback" : "ready" });
+    void assets.fontsReady?.then(() => post({ type: "imageExportFontsReady", requestId: request.requestId }), () => {});
+    style.textContent = assets.css + generateCardCss({ theme: resolvedTheme, fontStyle, fontSize, cardWidth });
+    const images = Array.from(documentRoot.querySelectorAll<HTMLImageElement>("img"));
+    await Promise.race([
+      Promise.all([
+        document.fonts?.ready,
+        ...images.map(async (image) => {
+          if (image.complete) return;
+          try { await image.decode(); } catch { /* Export the readable remainder. */ }
+        }),
+      ]),
+      new Promise<void>((resolve) => window.setTimeout(resolve, 8_000)),
+    ]);
     const exportedImages = Array.from(
       documentRoot.querySelectorAll<HTMLImageElement>(".edgeever-card-body img"),
     );
     const failedImages = exportedImages.filter((image) => !image.complete || image.naturalWidth === 0).length;
     const totalHeight = Math.max(1, Math.ceil(documentRoot.getBoundingClientRect().height));
+    const renderPlan = planNativeNoteImageRender(targetWidth, totalHeight);
+    let embedFailedImages = 0;
+    let captureRoot = documentRoot;
+    let captureWrapper: HTMLDivElement | null = null;
+    if (renderPlan.sourceScale < 1) {
+      captureWrapper = document.createElement("div");
+      captureWrapper.style.cssText = `position:relative;width:${renderPlan.sourceWidth}px;height:${renderPlan.sourceHeight}px;overflow:hidden;`;
+      documentRoot.replaceWith(captureWrapper);
+      captureWrapper.appendChild(documentRoot);
+      documentRoot.style.transform = `scale(${renderPlan.sourceScale})`;
+      documentRoot.style.transformOrigin = "top left";
+      captureRoot = captureWrapper;
+    }
     const backgroundColor = NOTE_IMAGE_BACKGROUND_COLORS[resolvedTheme] || themeCfg.canvasBg;
 
-    const canvas = await toCanvas(documentRoot, {
+    const missingImagePlaceholder = "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";
+    const renderCanvas = (root: HTMLElement, width: number, height: number) => toCanvas(root, {
       backgroundColor,
       cacheBust: false,
-      height: totalHeight,
-      pixelRatio: 2,
-      skipFonts: true,
-      width: targetWidth,
+      height,
+      imagePlaceholder: missingImagePlaceholder,
+      onImageErrorHandler: (event) => {
+        embedFailedImages += 1;
+        if (event instanceof Event && event.target instanceof HTMLImageElement) {
+          event.target.src = missingImagePlaceholder;
+        }
+      },
+      pixelRatio: renderPlan.pixelRatio,
+      fontEmbedCSS: assets.fontCss,
+      width,
     });
+    let canvas: HTMLCanvasElement;
+    try {
+      canvas = await renderCanvas(captureRoot, renderPlan.sourceWidth, renderPlan.sourceHeight);
+    } catch {
+      const retryScale = renderPlan.sourceScale * 0.75;
+      if (retryScale < 0.5) throw new Error("NOTE_IMAGE_RENDER_FAILED");
+      const retryWidth = Math.max(1, Math.floor(targetWidth * retryScale));
+      const retryHeight = Math.max(1, Math.floor(totalHeight * retryScale));
+      if (!captureWrapper) {
+        captureWrapper = document.createElement("div");
+        documentRoot.replaceWith(captureWrapper);
+        captureWrapper.appendChild(documentRoot);
+      }
+      captureWrapper.style.cssText = `position:relative;width:${retryWidth}px;height:${retryHeight}px;overflow:hidden;`;
+      documentRoot.style.transform = `scale(${retryScale})`;
+      documentRoot.style.transformOrigin = "top left";
+      try {
+        canvas = await renderCanvas(captureWrapper, retryWidth, retryHeight);
+      } catch {
+        throw new Error("NOTE_IMAGE_RENDER_FAILED");
+      }
+    }
     const blob = await new Promise<Blob>((resolve, reject) => {
       canvas.toBlob(
         (result) => result ? resolve(result) : reject(new Error("Image renderer returned an empty file")),
@@ -1311,13 +1398,14 @@ async function exportNoteImage(request: ImageExportRequest) {
     }
     post({
       type: "imageExportComplete",
+      fontFallback: assets.fontFallback,
       requestId: request.requestId,
       filename,
       mimeType,
       width: canvas.width,
       height: canvas.height,
       totalImages: exportedImages.length,
-      failedImages,
+      failedImages: Math.min(exportedImages.length, failedImages + embedFailedImages),
     });
   } catch (error) {
     post({ type: "imageExportError", requestId: request.requestId, message: error instanceof Error ? error.message : "Image export failed" });
@@ -1330,6 +1418,7 @@ export type EdgeEverEditorAPI = {
   configure: (opts: ConfigureOptions) => void;
   setMarkdown: (md: string) => void;
   setDocumentFromJSON: (json: string) => void;
+  resetReaderScroll: () => void;
   resolveResource: (requestId: string, dataUrl: string | null) => void;
   getMarkdown: () => string;
   getDocument: () => string;
@@ -1348,6 +1437,7 @@ export type EdgeEverEditorAPI = {
 };
 
 const api: EdgeEverEditorAPI = {
+  resetReaderScroll,
   exportImage(request) {
     void exportNoteImage(request);
   },
@@ -1355,8 +1445,10 @@ const api: EdgeEverEditorAPI = {
     const nextMode = opts.mode === "editor" ? "editor" : "viewer";
     const modeChanged = nextMode !== mode;
     mode = nextMode;
-    locale = opts.locale === "en-US" ? "en-US" : "zh-CN";
-    editor.setEditable(mode === "editor");
+    locale = opts.locale === "en-US" || opts.locale === "ja" || opts.locale === "pl" ? opts.locale : "zh-CN";
+    // Configuring a reused WebView is not a document edit. TipTap otherwise emits
+    // an update for its old (often empty) body before native pushes the share seed.
+    editor.setEditable(mode === "editor", false);
     setToolbarVisible(mode === "editor");
     document.documentElement.dataset.theme = opts.theme || "light";
     document.body.classList.toggle("viewer-mode", mode === "viewer");

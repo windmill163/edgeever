@@ -2,22 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 
 describe("editor body font preference", () => {
-  test("is chosen from settings and offers the bundled faces", () => {
+  test("is chosen from settings and loads optional faces through the shared loader", () => {
     const preferenceCard = readFileSync(new URL("./PreferenceCard.tsx", import.meta.url), "utf8");
     const editorFonts = readFileSync(new URL("../../styles/editor-body-fonts.css", import.meta.url), "utf8");
     const fontFaces = readFileSync(new URL("../../lib/editor-body-font-faces.ts", import.meta.url), "utf8");
 
     expect(preferenceCard).toContain('t("settings.editorBodyFontTitle")');
-    expect(preferenceCard).toContain('value="wenkai"');
-    expect(preferenceCard).toContain('value="source-han-serif"');
+    expect(preferenceCard).toContain('includeCatalog ? FONT_IDS : ["wenkai", "zhuque"]');
+    expect(preferenceCard).toContain('value={id} textValue={t(FONT_CATALOG[id].labelKey)}');
+    expect(preferenceCard).toContain('["source-han-serif", "sourceHanSerif"]');
     expect(preferenceCard).toContain('value="custom"');
-    expect(fontFaces).toContain('fontFace("EdgeEver Kai"');
-    expect(fontFaces).toContain('fontFace("EdgeEver Fangsong"');
-    expect(fontFaces).toContain('fontFace("EdgeEver Zhi Song"');
-    expect(fontFaces).toContain('fontFace("EdgeEver Song"');
-    expect(fontFaces).toContain("kai.woff2?url");
-    expect(fontFaces).toContain("fangsong.woff2?url");
-    expect(fontFaces).toContain("zhi-song.woff2?url");
+    expect(fontFaces).toContain("configureBundledFontAssets(noteImageAssetUrls)");
+    expect(fontFaces).not.toContain("loadOfflineFonts(");
+    expect(fontFaces).not.toContain("assets/fonts/editor-body/");
     expect(preferenceCard).toContain('t("settings.uiFontTitle")');
     expect(preferenceCard).toContain("applyUiFontPreference");
     expect(preferenceCard).toContain("getFontChoicePreviewStack");
@@ -33,22 +30,6 @@ describe("editor body font preference", () => {
     for (const fileName of ["kai.woff2", "kai-screen.woff2", "fangsong.woff2", "song.woff2", "zhi-song.woff2", "hei.woff2", "source-serif-4-regular.woff2", "OFL-lxgw-wenkai.txt", "OFL-zhuque-fangsong.txt", "OFL-source-han-serif.txt", "OFL-source-serif-4.txt", "IPA-lxgw-neo-zhi-song.txt"]) {
       expect(existsSync(new URL(`../../assets/fonts/editor-body/${fileName}`, import.meta.url))).toBe(true);
     }
-  });
-});
-
-describe("editor content width preference", () => {
-  test("is a device-local reading setting instead of a per-note toolbar control", () => {
-    const preferenceCard = readFileSync(new URL("./PreferenceCard.tsx", import.meta.url), "utf8");
-    const editorPane = readFileSync(new URL("../EditorPane.tsx", import.meta.url), "utf8");
-
-    expect(preferenceCard).toContain('t("settings.editorContentWidthTitle")');
-    expect(preferenceCard).not.toContain('t("settings.editorContentWidthDescription")');
-    expect(preferenceCard).toContain("onEditorContentWidthChange(value as EditorContentWidth)");
-    expect(preferenceCard).toContain('hidden min-h-16 flex-col');
-    expect(preferenceCard).toContain("lg:flex");
-    expect(editorPane).toContain('window.matchMedia("(min-width: 1024px)")');
-    expect(editorPane).toContain("editorContentColumnMaxWidth");
-    expect(editorPane).not.toContain("onToggleEditorContentAlignment");
   });
 });
 
@@ -73,7 +54,6 @@ describe("reading typography settings", () => {
     expect(preferenceCard).not.toContain('t("settings.editorBodyFontSizeDescription")');
     expect(preferenceCard).toContain('t("settings.editorBodyLineHeightTitle")');
     expect(preferenceCard).not.toContain('t("settings.editorBodyLineHeightDescription")');
-    expect(preferenceCard).not.toContain('t("settings.editorContentWidthDescription")');
     expect(preferenceCard).toContain('t("settings.editorBodyPaletteTitle")');
     expect(preferenceCard).toContain("NoteProsePaletteSwatch");
     expect(preferenceCard).toContain("NOTE_PROSE_PALETTES[paletteId].accent");

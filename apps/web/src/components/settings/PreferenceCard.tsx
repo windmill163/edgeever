@@ -1,9 +1,20 @@
-import { AlignHorizontalJustifyCenter, AlignVerticalSpaceAround, AppWindow, BookOpenText, ChartNoAxesCombined, Code2, Image, Keyboard, Languages, ListTree, MousePointerClick, Palette, Sparkles, SunMoon, Type } from "lucide-react";
-import { useState, useEffect, type ReactNode } from "react";
+import { LEGACY_BODY_FONTS } from "@edgeever/shared/font-resources";
+import type { BodyFontId } from "@edgeever/shared/font-loader";
+import { useFontPreviewStatus } from "@/lib/use-font-preview-status";
+import { FONT_CATALOG, FONT_IDS, isRemoteNoteImageFont } from "@edgeever/shared/font-catalog";
+import { FontLoadFeedback } from "@/components/FontLoadFeedback";
+import { editorFontLoadState, uiFontLoadState, retryEditorCatalogFont, retryUiCatalogFont } from "@/lib/editor-catalog-fonts";
+import { FontLabel } from "@/components/FontLabel";
+import { AlignVerticalSpaceAround, AppWindow, BookOpenText, ChartNoAxesCombined, Code2, Image, Keyboard, Languages, ListTree, MousePointerClick, Palette, Sparkles, SpellCheck, SunMoon, Type } from "lucide-react";
+import { useState, useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import type { EditorContentWidth } from "@/lib/editor-content-width";
 import type { NoteProsePatch, NoteProsePaletteChoice, ResolvedNoteProse } from "@edgeever/shared";
 import { DEFAULT_NOTE_PROSE_CSS, MAX_NOTE_PROSE_CSS_BYTES, NOTE_PROSE_FONT_SIZES, NOTE_PROSE_PALETTE_CHOICES, NOTE_PROSE_PALETTES, noteProseCssDropsDeclarations } from "@edgeever/shared";
+import {
+  EDITOR_SPELLCHECK_CHANGED_EVENT,
+  readEditorSpellcheckPreference,
+  writeEditorSpellcheckPreference,
+} from "@/lib/editor-spellcheck-preference";
 import {
   EDITOR_LINK_OPEN_MODE_CHANGED_EVENT,
   getStoredEditorLinkOpenMode,
@@ -23,7 +34,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { SETTINGS_ITEM_DESCRIPTION_CLASSNAME, SETTINGS_ITEM_ICON_CLASSNAME, SETTINGS_ITEM_TITLE_CLASSNAME } from "./settings-ui";
+import { SETTINGS_ITEM_ICON_CLASSNAME, SETTINGS_ITEM_TITLE_CLASSNAME } from "./settings-ui";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
@@ -45,6 +56,7 @@ import {
 import { applyUiFontPreference, readUiFontPreference, writeUiFontPreference } from "@/lib/ui-font";
 import { syncPublishedNoteBodyFont } from "@/lib/published-note-body-font";
 import { useShowDescendantNotesPreference, writeShowDescendantNotesPreference } from "@/lib/descendant-notes-preference";
+import { PicGoSettingsItem } from "./PicGoSettingsItem";
 import { NoteProseCssEditor } from "./NoteProseCssEditor";
 import { NoteProseCssPreview } from "./NoteProseCssPreview";
 
@@ -74,82 +86,53 @@ const FontChoiceFields = ({
   label,
   preference,
   onChange,
+  includeCatalog = false,
 }: {
+  includeCatalog?: boolean;
   label: string;
   preference: EditorBodyFontPreference;
   onChange: (preference: EditorBodyFontPreference) => void;
 }) => {
   const { t } = useTranslation();
+  const [fontOpen, setFontOpen] = useState(false);
+  const [fontRetry, setFontRetry] = useState(0);
+  const loadState = includeCatalog ? editorFontLoadState : uiFontLoadState;
+  const bodyStatus = useSyncExternalStore(loadState.subscribe, loadState.getSnapshot, loadState.getSnapshot);
+  const catalogSelected = isRemoteNoteImageFont(preference.choice) || preference.choice in LEGACY_BODY_FONTS;
+  const selectedLabel = isRemoteNoteImageFont(preference.choice) ? t(FONT_CATALOG[preference.choice].labelKey) : t(`settings.editorBodyFonts.${preference.choice === "wenkai-screen" ? "wenkaiScreen" : preference.choice === "neo-zhi-song" ? "neoZhiSong" : "sourceSerif"}`);
+  const { status: selectedStatus, onPreviewStatus } = useFontPreviewStatus(`${preference.choice}:${fontRetry}`, bodyStatus === "idle" ? "loading" : bodyStatus);
   return (
     <div className="flex w-full shrink-0 flex-col gap-2 sm:w-80">
       <Select
         value={preference.choice}
+        onOpenChange={setFontOpen}
         onValueChange={(value) => onChange({ choice: value as EditorBodyFontChoice, customFamily: preference.customFamily })}
       >
         <SelectTrigger aria-label={label} className="h-9 bg-card">
-          <SelectValue />
+          <SelectValue>{catalogSelected ? <FontLabel label={selectedLabel} fontId={preference.choice as BodyFontId} enabled onStatusChange={onPreviewStatus} status={selectedStatus} retryKey={fontRetry} /> : undefined}</SelectValue>
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent className="max-h-80">
           <SelectItem value="system">{t("settings.editorBodyFonts.system")}</SelectItem>
-          <SelectItem
-            value="wenkai"
-            style={{ fontFamily: getFontChoicePreviewStack("wenkai") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("wenkai") }}>
-              {t("settings.editorBodyFonts.wenkai")}
-            </span>
-          </SelectItem>
-          <SelectItem
-            value="wenkai-screen"
-            style={{ fontFamily: getFontChoicePreviewStack("wenkai-screen") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("wenkai-screen") }}>
-              {t("settings.editorBodyFonts.wenkaiScreen")}
-            </span>
-          </SelectItem>
-          <SelectItem
-            value="zhuque"
-            style={{ fontFamily: getFontChoicePreviewStack("zhuque") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("zhuque") }}>
-              {t("settings.editorBodyFonts.zhuque")}
-            </span>
-          </SelectItem>
-          <SelectItem
-            value="source-han-serif"
-            style={{ fontFamily: getFontChoicePreviewStack("source-han-serif") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("source-han-serif") }}>
-              {t("settings.editorBodyFonts.sourceHanSerif")}
-            </span>
-          </SelectItem>
-          <SelectItem
-            value="neo-zhi-song"
-            style={{ fontFamily: getFontChoicePreviewStack("neo-zhi-song") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("neo-zhi-song") }}>
-              {t("settings.editorBodyFonts.neoZhiSong")}
-            </span>
-          </SelectItem>
-          <SelectItem
-            value="source-han-sans"
-            style={{ fontFamily: getFontChoicePreviewStack("source-han-sans") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("source-han-sans") }}>
-              {t("settings.editorBodyFonts.sourceHanSans")}
-            </span>
-          </SelectItem>
-          <SelectItem
-            value="source-serif"
-            style={{ fontFamily: getFontChoicePreviewStack("source-serif") }}
-          >
-            <span style={{ fontFamily: getFontChoicePreviewStack("source-serif") }}>
-              {t("settings.editorBodyFonts.sourceSerif")}
-            </span>
-          </SelectItem>
+          {!includeCatalog ? ([
+            ["wenkai-screen", "wenkaiScreen"], ["source-han-serif", "sourceHanSerif"],
+            ["neo-zhi-song", "neoZhiSong"], ["source-han-sans", "sourceHanSans"], ["source-serif", "sourceSerif"],
+          ] as const).map(([id, key]) => <SelectItem key={id} value={id} textValue={t(`settings.editorBodyFonts.${key}`)}>
+            <FontLabel label={t(`settings.editorBodyFonts.${key}`)} fontId={id} enabled={fontOpen} visibleOnly />
+          </SelectItem>) : null}
+          {includeCatalog && ["wenkai-screen", "neo-zhi-song", "source-serif"].includes(preference.choice) ? (
+            <SelectItem value={preference.choice} style={{ fontFamily: getFontChoicePreviewStack(preference.choice) }}>
+              {t(`settings.editorBodyFonts.${preference.choice === "wenkai-screen" ? "wenkaiScreen" : preference.choice === "neo-zhi-song" ? "neoZhiSong" : "sourceSerif"}`)}
+            </SelectItem>
+          ) : null}
+          {(includeCatalog ? FONT_IDS : ["wenkai", "zhuque"] as const).map(id => (
+            <SelectItem key={id} value={id} textValue={t(FONT_CATALOG[id].labelKey)}>
+              <FontLabel label={t(FONT_CATALOG[id].labelKey)} fontId={id} enabled={fontOpen} visibleOnly />
+            </SelectItem>
+          ))}
           <SelectItem value="custom">{t("settings.editorBodyFonts.custom")}</SelectItem>
         </SelectContent>
       </Select>
+      {catalogSelected ? <FontLoadFeedback status={selectedStatus} onRetry={() => { setFontRetry(value => value + 1); (includeCatalog ? retryEditorCatalogFont : retryUiCatalogFont)(); }} /> : null}
       {preference.choice === "custom" ? (
         <div className="flex flex-col gap-1.5">
           <Input
@@ -196,8 +179,6 @@ const NOTE_PROSE_LINE_HEIGHT_OPTIONS = [
 interface PreferenceCardProps {
   imageCompressionEnabled: boolean;
   onImageCompressionChange: (enabled: boolean) => void;
-  editorContentWidth: EditorContentWidth;
-  onEditorContentWidthChange: (width: EditorContentWidth) => void;
   noteProse: ResolvedNoteProse;
   onNoteProseChange: (patch: NoteProsePatch) => void;
 }
@@ -205,8 +186,6 @@ interface PreferenceCardProps {
 export const PreferenceCard = ({
   imageCompressionEnabled,
   onImageCompressionChange,
-  editorContentWidth,
-  onEditorContentWidthChange,
   noteProse,
   onNoteProseChange,
 }: PreferenceCardProps) => {
@@ -221,6 +200,7 @@ export const PreferenceCard = ({
   const [linkOpenMode, setLinkOpenMode] = useState<EditorLinkOpenMode>(() => getStoredEditorLinkOpenMode());
   const [aiSelectionMenuEnabled, setAiSelectionMenuEnabled] = useState(readAiSelectionMenuPreference);
   const [aiSpaceShortcutEnabled, setAiSpaceShortcutEnabled] = useState(readAiSpaceShortcutPreference);
+  const [spellcheckEnabled, setSpellcheckEnabled] = useState(readEditorSpellcheckPreference);
   const [editorBodyFont, setEditorBodyFont] = useState(readEditorBodyFontPreference);
   const [uiFont, setUiFont] = useState(readUiFontPreference);
 
@@ -238,6 +218,24 @@ export const PreferenceCard = ({
     window.addEventListener("storage", syncPreference);
     return () => {
       window.removeEventListener(AI_SPACE_SHORTCUT_CHANGED_EVENT, onPreferenceChanged);
+      window.removeEventListener("storage", syncPreference);
+    };
+  }, []);
+
+  useEffect(() => {
+    const syncPreference = () => setSpellcheckEnabled(readEditorSpellcheckPreference());
+    const onPreferenceChanged = (event: Event) => {
+      const detail = (event as CustomEvent<boolean>).detail;
+      if (typeof detail === "boolean") {
+        setSpellcheckEnabled(detail);
+        return;
+      }
+      syncPreference();
+    };
+    window.addEventListener(EDITOR_SPELLCHECK_CHANGED_EVENT, onPreferenceChanged);
+    window.addEventListener("storage", syncPreference);
+    return () => {
+      window.removeEventListener(EDITOR_SPELLCHECK_CHANGED_EVENT, onPreferenceChanged);
       window.removeEventListener("storage", syncPreference);
     };
   }, []);
@@ -399,29 +397,6 @@ export const PreferenceCard = ({
       </PreferenceSection>
 
       <PreferenceSection title={t("settings.groups.reading")}>
-        <div className="hidden min-h-16 flex-col items-start gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 lg:flex">
-          <div className="flex min-w-0 items-center gap-3">
-            <AlignHorizontalJustifyCenter className="h-4 w-4 shrink-0 text-slate-500" />
-            <div className="min-w-0">
-              <div className={SETTINGS_ITEM_TITLE_CLASSNAME}>{t("settings.editorContentWidthTitle")}</div>
-            </div>
-          </div>
-          <div className="w-full shrink-0 sm:w-80">
-            <Select
-              value={editorContentWidth}
-              onValueChange={(value) => onEditorContentWidthChange(value as EditorContentWidth)}
-            >
-              <SelectTrigger aria-label={t("settings.editorContentWidthTitle")} className="h-9 bg-card">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="standard">{t("settings.editorContentWidths.standard")}</SelectItem>
-                <SelectItem value="wide">{t("settings.editorContentWidths.wide")}</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-
         <div className="flex min-h-16 flex-col items-start gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <BookOpenText className="h-4 w-4 shrink-0 text-slate-500" />
@@ -432,6 +407,7 @@ export const PreferenceCard = ({
           <FontChoiceFields
             label={t("settings.editorBodyFontTitle")}
             preference={editorBodyFont}
+            includeCatalog
             onChange={updateEditorBodyFont}
           />
         </div>
@@ -562,6 +538,7 @@ export const PreferenceCard = ({
       </PreferenceSection>
 
       <PreferenceSection title={t("settings.groups.editing")}>
+        <PicGoSettingsItem />
         <div className="flex min-h-16 flex-col items-start gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <Image className="h-4 w-4 shrink-0 text-slate-500" />
@@ -574,6 +551,25 @@ export const PreferenceCard = ({
               checked={imageCompressionEnabled}
               onCheckedChange={onImageCompressionChange}
               aria-label={t("settings.imageCompressionAria")}
+            />
+          </div>
+        </div>
+
+        <div className="flex min-h-16 flex-col items-start gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <SpellCheck className="h-4 w-4 shrink-0 text-slate-500" />
+            <div className="min-w-0">
+              <div className={SETTINGS_ITEM_TITLE_CLASSNAME}>{t("settings.spellcheckTitle")}</div>
+            </div>
+          </div>
+          <div className="flex w-full shrink-0 justify-start sm:w-44 sm:justify-end">
+            <Switch
+              checked={spellcheckEnabled}
+              onCheckedChange={(enabled) => {
+                writeEditorSpellcheckPreference(enabled);
+                setSpellcheckEnabled(enabled);
+              }}
+              aria-label={t("settings.spellcheckAria")}
             />
           </div>
         </div>

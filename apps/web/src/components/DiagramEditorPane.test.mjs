@@ -110,7 +110,6 @@ describe("diagram editor canvas surface", () => {
     expect(source).toContain('data-space-pan={spacePanActive ? "active" : undefined}');
     expect(source).toContain('data-shift-select={shiftSelectActive ? "active" : undefined}');
     expect(source).toContain('t("diagram.navHintPan")');
-    expect(source).toContain('t("diagram.navHintHoldShift")');
     expect(source).toContain('t("diagram.navHintBoxSelect")');
     expect(globalStyles).toContain('data-shift-select="active"');
     expect(globalStyles).toContain("cursor: crosshair");
@@ -152,7 +151,8 @@ describe("diagram editor canvas surface", () => {
     expect(source).toContain("EDITOR_LOCAL_SAVE_DELAY_MS");
     expect(source).toContain("window.setTimeout(() => saveRef.current(), EDITOR_LOCAL_SAVE_DELAY_MS)");
     expect(source).toContain("nodeEditor !== null");
-    expect(source).toContain("[dirtyVersion, editSessionReady, editorDirty, nodeEditor, readOnly, saveFailed, saving]");
+    expect(source).toContain("outlineError || outlinePendingBulk || nodeEditor !== null");
+    expect(source).toContain("[dirtyVersion, editSessionReady, editorDirty, nodeEditor, outlineError, outlinePendingBulk, readOnly, saveFailed, saving]");
     expect(source).toContain("tags: nextTags");
     expect(source).toContain("setTagsDirty(hasNewTagChanges)");
     expect(source).toContain("!readOnly && saveFailed");
@@ -275,10 +275,17 @@ describe("diagram editor canvas surface", () => {
   test("reuses the architecture shape-library trigger across every diagram kind", () => {
     expect(toolbarSource).toContain("export const DiagramToolbarAddTrigger");
     expect(toolbarSource).toContain("<DropdownMenuTrigger asChild>");
-    expect(toolbarSource).toContain('<Button size="sm" variant="soft" onPointerEnter={onPointerEnter}>');
+    expect(toolbarSource).toContain('if (event.pointerType === "mouse") onPointerEnter(event);');
     expect(toolbarSource).toContain('<Boxes className="h-4 w-4" />');
     expect(toolbarSource).toContain('{t("diagram.componentLibrary")}');
     expect(source.match(/<DiagramToolbarAddTrigger onPointerEnter=/g)).toHaveLength(2);
+  });
+
+  test("keeps a shape menu opened by hover from blocking the rest of the editor", () => {
+    // Touch fires pointerenter right before the pointerdown that toggles the
+    // menu, and a modal menu hides the back button while it is open.
+    expect(toolbarSource).not.toContain("onPointerEnter={onPointerEnter}");
+    expect(source.match(/<DropdownMenu modal=\{false\} open=\{open\}/g)).toHaveLength(2);
   });
 
   test("exposes connection handles on flowcharts and architecture components with safe connection rules", () => {

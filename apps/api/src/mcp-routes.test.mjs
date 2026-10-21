@@ -24,6 +24,15 @@ const createApp = (overrides = {}) => {
   return app;
 };
 
+test("poster previews emit MCP image content without duplicating base64 in metadata", async () => {
+  const app = createApp({ callTool: async () => ({ available: true, revision: 1, image: { data: "AQID", mimeType: "image/png" } }) });
+  const response = await app.request("/mcp", mcpRequest({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_poster_preview", arguments: { memoId: "poster" } } }, { "MCP-Protocol-Version": "2025-11-25" }));
+  const result = (await response.json()).result;
+  expect(result.content[1]).toEqual({ type: "image", data: "AQID", mimeType: "image/png" });
+  expect(result.content[0].text).not.toContain("AQID");
+  expect(result.structuredContent.image).toBeUndefined();
+});
+
 const mcpRequest = (payload, headers = {}) => ({
   method: "POST",
   headers: {
@@ -36,12 +45,12 @@ const mcpRequest = (payload, headers = {}) => ({
 
 const modernMcpRequest = (payload, headers = {}) => {
   const params = {
-    ...(payload.params ?? {}),
+    ...payload.params,
     _meta: {
       "io.modelcontextprotocol/protocolVersion": "2026-07-28",
       "io.modelcontextprotocol/clientInfo": { name: "edgeever-test", version: "1.0.0" },
       "io.modelcontextprotocol/clientCapabilities": {},
-      ...(payload.params?._meta ?? {}),
+      ...payload.params?._meta,
     },
   };
   const name = payload.method === "resources/read" ? params.uri : params.name;

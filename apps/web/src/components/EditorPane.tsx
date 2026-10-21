@@ -1,3 +1,4 @@
+import { AI_ASSISTANT_LAUNCHER_POSITION } from "@/lib/ai-assistant-launcher";
 import { useRef, useState, useEffect, useLayoutEffect, useCallback, useMemo, lazy, Suspense, type CSSProperties, type FocusEvent as ReactFocusEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
@@ -11,13 +12,11 @@ import {
   History,
   RotateCcw,
   Trash2,
-  Tags,
   ReplaceAll,
   Paperclip,
   Pencil,
   Sparkles,
   Type,
-  X,
   Check,
   CircleAlert,
   LoaderCircle,
@@ -26,11 +25,14 @@ import {
   Printer,
   Image as ImageIcon,
   Share2,
+  Globe,
   Copy,
+  CopyPlus,
   Lock,
   LockOpen,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { EditorTableContextMenu } from "@/components/EditorTableContextMenu";
 import { ClipboardCopyNotice } from "@/components/ClipboardCopyNotice";
 import { WeChatCopyProgress } from "@/components/WeChatCopyProgress";
 import { MemoEditorHeaderActions } from "@/components/MemoEditorHeaderActions";
@@ -45,13 +47,10 @@ import {
   nextTitleStatusClearance,
 } from "@/components/MemoEditorChromeDensity";
 import { MemoTitleInput } from "@/components/MemoTitleInput";
-import { Input } from "@/components/ui/input";
 import {
-  DropdownMenu,
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { EditorToolbar } from "./EditorToolbar";
 import { EditorOutline } from "./EditorOutline";
 import { SelectionAiActions } from "./editor/SelectionAiActions";
@@ -61,16 +60,17 @@ import {
   isEditorInstanceHydratedForMemo,
   reconcileEditorInstanceMemoIdentity,
   remapEditorInstanceMemoIdentity,
+  resolveEditorInsertionMemoId,
 } from "./editor/editor-instance-identity";
 import {
-  isMarkdownSourceUnchanged,
+  analyzeMarkdownModeContent,
   resolveMarkdownModeContent,
 } from "./editor/editor-mode-content";
 import { useEditorMarkdownMode } from "./editor/useEditorMarkdownMode";
 import {
   ImageUploadPlaceholderExtension,
   addImageUploadPlaceholder,
-  createImageUploadPlaceholder,
+  createResourceUploadPlaceholder,
   removeImageUploadPlaceholder,
   waitForImageSourceReady,
   updateImageUploadPlaceholder,
@@ -102,7 +102,7 @@ import { sanitizeAndScopeCss } from "@/lib/css-sandbox";
 import { RevisionHistoryDialog } from "./dialogs/RevisionHistoryDialog";
 import { ExternalLinkDialog } from "./dialogs/ExternalLinkDialog";
 import { MathFormulaDialog } from "./dialogs/MathFormulaDialog";
-import { EditorBlockDragHandle } from "./editor/EditorBlockDragHandle";
+import { SpeechProviderReachabilityError } from "@/lib/speech-transcription-error";
 import {
   applyMathFormula,
   deleteMathFormula,
@@ -118,17 +118,22 @@ import { api } from "@/lib/api";
 import { isDesktopResourceRuntime, stageDesktopResource, toDesktopResourceDownloadUrl, toDesktopResourceUrl } from "@/lib/desktop-resources";
 import { contentReferencesStagedResourceUrl, findMatchingMemoResource, repairMemoStagedResourceUrls, repairTiptapStagedResourceUrls } from "@/lib/staged-resource-repair";
 import { cn, parseTagsText } from "@/lib/utils";
-import { editorContentColumnMaxWidth, type EditorContentWidth } from "@/lib/editor-content-width";
 import {
   EDITOR_ARTICLE_ROW_GAP_PX,
   EDITOR_COMPACT_READING_GUTTER,
   EDITOR_PANE_TIGHT_PX,
   shouldCompactEditorReadingGutter,
 } from "@/lib/editor-reading-gutter";
-import { EDITOR_OUTLINE_WIDTH } from "@/lib/workspace-ui";
+import { EDITOR_CONTENT_MAX_WIDTH, EDITOR_OUTLINE_WIDTH } from "@/lib/workspace-ui";
 import {
+  resolveResourceUploadMimeType,
   countMemoCharacters,
   createEdgeEverDocumentExtensions,
+  getFrontMatterSource,
+  getMappedNoteProperties,
+  parseNoteProperties,
+  splitMarkdownFrontMatter,
+  updateNoteProperty,
   docToMarkdown,
   MEMO_CONTENT_STYLE,
   noteProseCssVariables,
@@ -149,11 +154,13 @@ import {
   getAiDocumentFingerprint,
   isAiSelectionSnapshotCurrent,
   parseMemoLinkHref,
+  getMemoDisplayTitle,
 } from "@edgeever/shared";
 import { NEW_IMAGE_WIDTH_PERCENT } from "@edgeever/shared/image-display";
 import { EdgeEverLink } from "@edgeever/shared/editor-link";
 import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
 import { codeBlockLowlight, EdgeEverCodeBlock } from "@/lib/code-block";
+import { shouldUploadWithPicGo, uploadImageWithPicGo } from "@/lib/picgo";
 import { compressImageForUpload } from "@/lib/image-compression";
 import { LOCAL_DATABASE_INTERRUPTED_EVENT, localDb, selectNewestLocalDraft, type MemoUpdateSyncPayload } from "@/lib/local-db";
 import { persistEmergencyDraft, readEmergencyDraft, removeEmergencyDraft } from "@/lib/emergency-draft";
@@ -220,6 +227,7 @@ import {
   AI_SELECTION_MENU_CHANGED_EVENT,
   readAiSelectionMenuPreference,
 } from "@/lib/ai-selection-menu-preference";
+import { useEditorSpellcheckPreference } from "@/lib/editor-spellcheck-preference";
 import {
   clipSelectionForSend,
   translationReplacement,
@@ -282,7 +290,8 @@ import {
   type ResourceDialogState,
   type ResourceMenuTarget,
 } from "./editor/useEditorResourceActions";
-import { removeAttachmentAt, renameAttachmentAt } from "./editor/attachment-editor-range";
+import { insertTranscriptAfterAttachment, removeAttachmentAt, renameAttachmentAt } from "./editor/attachment-editor-range";
+import { AttachmentTranscriptContext, type AttachmentTranscript, type AttachmentTranscriptContextValue } from "./editor/AttachmentTranscriptContext";
 import {
   createLocalEditSession,
   focusMobilePlainTextElement,
@@ -294,7 +303,6 @@ import {
   shouldInsertDroppedResourceFiles,
   isCreatedMemoEditorFocused,
   isEditorReady,
-  MemoSaveRequestError,
   releaseEditorMedia,
   resetEditorDocument,
   shouldRetryCreatedMemoFocus,
@@ -308,11 +316,11 @@ import {
 } from "./editor/editor-pane-helpers";
 
 type EditorPaneProps = {
+  onCreatePoster?: (memo: MemoDetail, text: string) => Promise<void>;
   memo: MemoDetail | null;
   repository: EdgeEverRepository;
   desktopFocusMode: boolean;
   onToggleDesktopFocusMode: () => void;
-  editorContentWidth: EditorContentWidth;
   noteProse: ResolvedNoteProse;
   mobileDefaultEditMemoId: string | null;
   pendingInsertFiles?: { memoId: string; files: File[] } | null;
@@ -331,6 +339,7 @@ type EditorPaneProps = {
   onRestored: (memoId: string) => Promise<void>;
   onMobileDefaultEditConsumed: () => void;
   onSaveAsTemplate: (memo: MemoDetail, name: string) => Promise<void>;
+  onDuplicateMemo?: (memo: MemoDetail) => void;
   searchFocusToken: number;
   replaceFocusToken: number;
   aiAssistantOpenToken: number;
@@ -391,7 +400,6 @@ const RichEditorPane = ({
   repository,
   desktopFocusMode,
   onToggleDesktopFocusMode,
-  editorContentWidth,
   noteProse,
   mobileDefaultEditMemoId,
   pendingInsertFiles = null,
@@ -410,6 +418,8 @@ const RichEditorPane = ({
   onRestored,
   onMobileDefaultEditConsumed,
   onSaveAsTemplate,
+  onDuplicateMemo,
+  onCreatePoster,
   searchFocusToken,
   replaceFocusToken,
   aiAssistantOpenToken,
@@ -441,6 +451,8 @@ const RichEditorPane = ({
   // Keep field ownership and values in one React state update. memoRef changes
   // synchronously during hydration, before a new title/tags render can commit.
   const [memoFields, setMemoFields] = useState<EditorMemoFields>({ memoId: null, title: "", tagsText: "" });
+  const memoFieldsRef = useRef(memoFields);
+  memoFieldsRef.current = memoFields;
   const { memoId: fieldsMemoId, title, tagsText } = memoFields;
   const {
     dirtyVersion,
@@ -454,6 +466,9 @@ const RichEditorPane = ({
     setSaveState,
   } = useEditorSaveStatus();
   const [storageSaveError, setStorageSaveError] = useState(false);
+  const [saveErrorReasonKey, setSaveErrorReasonKey] = useState<string | null>(null);
+  const [richTableEditBlocked, setRichTableEditBlocked] = useState(false);
+  const revertingUnsafeMarkdownRef = useRef(false);
   const [hydratedEditorMemoId, setHydratedEditorMemoId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -470,6 +485,7 @@ const RichEditorPane = ({
     writeAiSidebarOpen(open);
   }, []);
   const aiBubbleMenu = useAiBubbleMenu();
+  const spellcheckEnabled = useEditorSpellcheckPreference();
   const [selectionPin, setSelectionPin] = useState<SelectionAiPin | null>(null);
   const [selectionRequest, setSelectionRequest] = useState<SelectionAiRequest | null>(null);
   const selectionPinRef = useRef<SelectionAiPin | null>(null);
@@ -492,6 +508,8 @@ const RichEditorPane = ({
     canRemove: false,
   });
   const [mathFormulaOpen, setMathFormulaOpen] = useState(false);
+  const [attachmentTranscript, setAttachmentTranscript] = useState<AttachmentTranscript | null>(null);
+  const attachmentTranscriptAbortRef = useRef<AbortController | null>(null);
   const [mathFormulaDraft, setMathFormulaDraft] = useState<MathFormulaDraft | null>(null);
   const {
     menuTarget: resourceMenuTarget,
@@ -668,6 +686,7 @@ const RichEditorPane = ({
   const editSessionRef = useRef<MemoEditSession | null>(null);
   const editorRef = useRef<Editor | null>(null);
   const editorCanvasInteractionVersionRef = useRef(0);
+  const persistResourceInsertionDraftRef = useRef<() => Promise<unknown>>(() => Promise.resolve());
   const openAiAssistantRef = useRef<() => void>(() => undefined);
   const aiSpaceShortcutEnabledRef = useRef(readAiSpaceShortcutPreference());
   const editorScrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -801,6 +820,7 @@ const RichEditorPane = ({
     memo?.id ?? null,
   );
   const editorInstanceMemoKey = editorInstanceMemoIdentityRef.current.instanceKey;
+  useEffect(() => setImageUploadState("idle"), [editorInstanceMemoKey]);
   const editorIsHydratedForCurrentMemo = isEditorInstanceHydratedForMemo(
     editorInstanceMemoIdentityRef.current,
     hydratedEditorMemoId,
@@ -827,6 +847,9 @@ const RichEditorPane = ({
         mappings,
       );
       memoRef.current = { ...currentMemo, id: nextMemoId };
+      if (memoFieldsRef.current.memoId === previousMemoId) {
+        memoFieldsRef.current = { ...memoFieldsRef.current, memoId: nextMemoId };
+      }
       setMemoFields((fields) => fields.memoId === previousMemoId
         ? { ...fields, memoId: nextMemoId }
         : fields);
@@ -971,6 +994,20 @@ const RichEditorPane = ({
   }, [focusMobileInputTarget, isMobileViewport, memo?.id, mobileDefaultEditMemoId, onMobileDefaultEditConsumed, readOnly]);
 
   const uploadEditorResource = useCallback(async (targetMemoId: string, uploadFile: File, isImage: boolean) => {
+    const mimeType = resolveResourceUploadMimeType(uploadFile.name, uploadFile.type);
+    if (mimeType !== uploadFile.type) uploadFile = new File([uploadFile], uploadFile.name, { type: mimeType, lastModified: uploadFile.lastModified });
+    if (isImage && shouldUploadWithPicGo()) {
+      const instanceKey = editorInstanceMemoIdentityRef.current.instanceKey;
+      const external = await uploadImageWithPicGo(uploadFile, {
+        title: t("settings.picgo.failedTitle"), message: t("settings.picgo.failedMessage"),
+        retry: t("settings.picgo.retry"), fallback: t("settings.picgo.fallback"), cancel: t("settings.picgo.cancel"),
+      });
+      // PicGo or its failure dialog may outlive the original note/instance.
+      if (memoRef.current?.id !== targetMemoId || editorInstanceMemoIdentityRef.current.instanceKey !== instanceKey) {
+        throw new Error("The active note changed during image upload");
+      }
+      if (external) return external;
+    }
     try {
       const resource = (await repository.uploadMemoResource(targetMemoId, uploadFile)).resource;
       return { ...resource, url: toDesktopResourceUrl(resource.url) };
@@ -1001,7 +1038,7 @@ const RichEditorPane = ({
         url: `edgeever-staged://${staged.id}`,
       };
     }
-  }, [repository]);
+  }, [repository, t]);
 
   const insertResourceFiles = useCallback((files: File[]) => {
     const currentMemo = memoRef.current;
@@ -1011,158 +1048,184 @@ const RichEditorPane = ({
       return false;
     }
 
-    const targetMemoId = currentMemo.id;
+    const requestedMemoId = currentMemo.id;
+    const requestedInstanceKey = editorInstanceMemoIdentityRef.current.instanceKey;
+    const resolveTargetMemoId = () => resolveEditorInsertionMemoId(
+      editorInstanceMemoIdentityRef.current,
+      requestedInstanceKey,
+      requestedMemoId,
+      memoRef.current?.id,
+    );
     const interactionVersionAtRequest = editorCanvasInteractionVersionRef.current;
     const placeholderPosition = currentEditor.state.selection.from;
-    const imagePlaceholderByFile = new Map(files
-      .filter((file) => SUPPORTED_PASTE_IMAGE_TYPES.has(file.type))
-      .map((file) => [file, createImageUploadPlaceholder(
-        file,
-        t("editor.uploadState.imagePreparing"),
-      )] as const));
-    const imagePlaceholders = [...imagePlaceholderByFile.values()];
-    imagePlaceholders.forEach((placeholder) => {
+    const placeholderByFile = new Map(files.map((file) => [file,
+      createResourceUploadPlaceholder(file, {
+        imagePreparing: t("editor.uploadState.imagePreparing"),
+        fileWaiting: t("editor.uploadState.waitingToUpload"),
+      }),
+    ] as const));
+    const placeholders = [...placeholderByFile.values()];
+    placeholders.forEach((placeholder) => {
       addImageUploadPlaceholder(currentEditor, placeholder, placeholderPosition);
     });
 
     void resourceInsertionLimit(async () => {
-      const insertionEditor = editorRef.current;
-      if (
-        memoRef.current?.id !== targetMemoId ||
-        !isEditorReady(insertionEditor) ||
-        !insertionEditor.isEditable
-      ) {
-        return;
-      }
+      let resumeDesktopSync: (() => void) | null = null;
+      try {
+        // A new desktop note can receive its durable ID while a file is being
+        // staged. Keep the note ID and staged resource together until the
+        // attachment has been inserted and its draft is durable locally.
+        if (isDesktopResourceRuntime()) {
+          resumeDesktopSync = await (await import("@/lib/desktop-sync")).pauseDesktopSyncForImport();
+        }
+        const insertionEditor = editorRef.current;
+        if (!resolveTargetMemoId() || !isEditorReady(insertionEditor) || !insertionEditor.isEditable) {
+          throw new Error("The note changed before the attachment could be inserted");
+        }
 
-      // Read the selection only after earlier resource insertions complete.
-      // Rapid consecutive pastes otherwise race with the same stale cursor.
-      const insertionTarget = getResourceInsertionTarget(insertionEditor.state.selection);
-      setImageUploadState("uploading");
-      const imageReadiness: Promise<void>[] = [];
-
-      const results = await processFileUploadBatch(files, async (file) => {
-        const isImage = SUPPORTED_PASTE_IMAGE_TYPES.has(file.type);
-        const shouldCompress = isImage && imageCompressionEnabledRef.current;
-        const placeholder = imagePlaceholderByFile.get(file);
-        if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
-          t(shouldCompress ? "editor.uploadState.imageCompressing" : "editor.uploadState.uploading"));
-        setImageUploadState(shouldCompress ? "compressing" : "uploading");
-        const preparedFile = shouldCompress ? (await compressImageForUpload(file)).file : file;
-        if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
-          t("editor.uploadState.waitingToUpload"));
-        return preparedFile;
-      }, async (uploadFile, file) => {
-        const isImage = SUPPORTED_PASTE_IMAGE_TYPES.has(file.type);
-        const placeholder = imagePlaceholderByFile.get(file);
+        // Read the selection only after earlier resource insertions complete.
+        // Rapid consecutive pastes otherwise race with the same stale cursor.
+        const insertionTarget = getResourceInsertionTarget(insertionEditor.state.selection);
         setImageUploadState("uploading");
-        if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
-          t("editor.uploadState.uploading"));
-        const resource = await uploadEditorResource(targetMemoId, uploadFile, isImage);
-        if (resource.kind === "image") {
-          imageReadiness.push(waitForImageSourceReady(resource.url));
+        const imageReadiness: Promise<void>[] = [];
+
+        const results = await processFileUploadBatch(files, async (file) => {
+          const isImage = SUPPORTED_PASTE_IMAGE_TYPES.has(resolveResourceUploadMimeType(file.name, file.type));
+          const shouldCompress = isImage && imageCompressionEnabledRef.current;
+          const placeholder = placeholderByFile.get(file);
+          if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
+            t(shouldCompress ? "editor.uploadState.imageCompressing" : "editor.uploadState.waitingToUpload"));
+          setImageUploadState(shouldCompress ? "compressing" : "uploading");
+          const preparedFile = shouldCompress ? (await compressImageForUpload(file)).file : file;
+          if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
+            t("editor.uploadState.waitingToUpload"));
+          return preparedFile;
+        }, async (uploadFile, file) => {
+          const targetMemoId = resolveTargetMemoId();
+          if (!targetMemoId) throw new Error("The active note changed during attachment upload");
+          const isImage = SUPPORTED_PASTE_IMAGE_TYPES.has(resolveResourceUploadMimeType(file.name, file.type));
+          const placeholder = placeholderByFile.get(file);
+          setImageUploadState("uploading");
+          if (placeholder) updateImageUploadPlaceholder(editorRef.current, placeholder,
+            t("editor.uploadState.uploading"));
+          const resource = await uploadEditorResource(targetMemoId, uploadFile, isImage);
+          if (resource.kind === "image") {
+            imageReadiness.push(waitForImageSourceReady(resource.url));
+          }
+          return resource;
+        });
+
+        const successfulResults = results.filter((result) => result.status === "fulfilled");
+        if (successfulResults.length > 0) {
+          void queryClient.invalidateQueries({ queryKey: ["resources"] });
         }
-        return resource;
-      });
+        await Promise.all(imageReadiness);
 
-      const successfulResults = results.filter((result) => result.status === "fulfilled");
-      if (successfulResults.length > 0) {
-        void queryClient.invalidateQueries({ queryKey: ["resources"] });
-      }
-      await Promise.all(imageReadiness);
-
-      const activeEditor = editorRef.current;
-      if (memoRef.current?.id !== targetMemoId || !isEditorReady(activeEditor)) {
-        setImageUploadState("idle");
-        return;
-      }
-
-      const content = successfulResults.map(({ file, value: resource }) => {
-        const filename = resource.filename || file.name;
-        if (resource.kind === "image") {
-          return {
-            type: "image",
-            attrs: {
-              src: resource.url,
-              alt: file.name,
-              title: file.name,
-              width: NEW_IMAGE_WIDTH_PERCENT,
-            },
-          };
+        const activeEditor = editorRef.current;
+        const activeMemoId = resolveTargetMemoId();
+        if (!activeMemoId || !isEditorReady(activeEditor) || !activeEditor.isEditable) {
+          throw new Error("The note changed before the attachment could be inserted");
         }
-        if (isPdfAttachment(file.type, filename)) {
+
+        const content = successfulResults.map(({ file, value: resource }) => {
+          const filename = resource.filename || file.name;
+          if (resource.kind === "image") {
+            return {
+              type: "image",
+              attrs: {
+                src: resource.url,
+                alt: file.name,
+                title: file.name,
+                width: NEW_IMAGE_WIDTH_PERCENT,
+              },
+            };
+          }
+          if (isPdfAttachment(file.type, filename)) {
+            return {
+              type: "paragraph",
+              content: [{
+                type: "edgeeverPdfAttachment",
+                attrs: {
+                  url: resource.url,
+                  label: t("editor.attachmentLabel", { filename }),
+                  filename,
+                  mimeType: resource.mimeType || file.type || "application/pdf",
+                  byteSize: resource.byteSize,
+                  displayMode: "compact",
+                },
+              }],
+            };
+          }
           return {
             type: "paragraph",
             content: [{
-              type: "edgeeverPdfAttachment",
+              type: "edgeeverFileAttachment",
               attrs: {
                 url: resource.url,
                 label: t("editor.attachmentLabel", { filename }),
                 filename,
-                mimeType: resource.mimeType || file.type || "application/pdf",
+                mimeType: file.type,
                 byteSize: resource.byteSize,
-                displayMode: "compact",
               },
             }],
           };
-        }
-        return {
-          type: "paragraph",
-          content: [{
-            type: "edgeeverFileAttachment",
-            attrs: {
-              url: resource.url,
-              label: t("editor.attachmentLabel", { filename }),
-              filename,
-              mimeType: file.type,
-              byteSize: resource.byteSize,
-            },
-          }],
-        };
-      });
+        });
 
-      if (content.length > 0) {
-        const safeInsertionTarget = clampResourceInsertionTarget(
-          insertionTarget,
-          activeEditor.state.doc.content.size,
-        );
-        const updateSelection = shouldSelectInsertedResources(
-          interactionVersionAtRequest,
-          editorCanvasInteractionVersionRef.current,
-        );
-        const insertion = activeEditor.chain();
-        if (updateSelection) {
-          insertion.focus();
+        if (content.length > 0) {
+          const safeInsertionTarget = clampResourceInsertionTarget(
+            insertionTarget,
+            activeEditor.state.doc.content.size,
+          );
+          const updateSelection = shouldSelectInsertedResources(
+            interactionVersionAtRequest,
+            editorCanvasInteractionVersionRef.current,
+          );
+          const insertion = activeEditor.chain();
+          if (updateSelection) {
+            insertion.focus();
+          }
+          const inserted = insertion
+            .command(insertUploadedResources(
+              safeInsertionTarget,
+              content,
+              updateSelection,
+            ))
+            .run();
+          if (!inserted) throw new Error("The attachment could not be inserted into the note");
+          if (!updateSelection) {
+            // ProseMirror can still map a cursor at the document boundary to a
+            // NodeSelection for the newly inserted block image. Honor the newer
+            // canvas click deterministically instead of trusting that mapping.
+            clearNodeSelectionAtDocumentEnd(activeEditor);
+          }
+          if (!getWritableEditorMemoFields(
+            memoFieldsRef.current,
+            activeMemoId,
+            hydratedMemoIdRef.current,
+            hydratingRef.current,
+          )) {
+            throw new Error("The attachment was inserted before the note finished loading");
+          }
+          await persistResourceInsertionDraftRef.current();
+          if (!hasUnsavedChangesRef.current) markDirtyStatus();
         }
-        insertion
-          .command(insertUploadedResources(
-            safeInsertionTarget,
-            content,
-            updateSelection,
-          ))
-          .run();
-        if (!updateSelection) {
-          // ProseMirror can still map a cursor at the document boundary to a
-          // NodeSelection for the newly inserted block image. Honor the newer
-          // canvas click deterministically instead of trusting that mapping.
-          clearNodeSelectionAtDocumentEnd(activeEditor);
-        }
-      }
 
-      if (results.some((result) => result.status === "rejected")) {
+        const failures = results.filter((result) => result.status === "rejected");
+        failures.forEach((result) => console.error("[editor] Attachment upload failed", result.reason));
+        setImageUploadState(failures.length > 0 ? "error" : "idle");
+      } catch (error) {
+        console.error("[editor] Attachment insertion failed", error);
         setImageUploadState("error");
-        window.setTimeout(() => setImageUploadState("idle"), 2200);
-      } else {
-        setImageUploadState("idle");
+      } finally {
+        resumeDesktopSync?.();
+        const placeholderEditor = editorRef.current;
+        placeholders.forEach((placeholder) => {
+          removeImageUploadPlaceholder(placeholderEditor, placeholder);
+        });
       }
-    }).finally(() => {
-      const placeholderEditor = editorRef.current;
-      imagePlaceholders.forEach((placeholder) => {
-        removeImageUploadPlaceholder(placeholderEditor, placeholder);
-      });
     });
     return true;
-  }, [queryClient, resourceInsertionLimit, t, uploadEditorResource]);
+  }, [markDirtyStatus, queryClient, resourceInsertionLimit, t, uploadEditorResource]);
 
   const pluginEmbedExtension = useMemo(() => createPluginEmbedExtension(pluginHost), [pluginHost]);
   const inlineFieldExtension = useMemo(() => createInlineFieldExtension(i18n.language), [i18n.language]);
@@ -1206,6 +1269,7 @@ const RichEditorPane = ({
     editorProps: {
       attributes: {
         class: "edgeever-note-rich-editor prose prose-slate max-w-none focus:outline-none min-h-[240px] lg:min-h-[180px]",
+        spellcheck: spellcheckEnabled ? "true" : "false",
       },
       handleKeyDown: (view, event) => {
         const { selection } = view.state;
@@ -1346,6 +1410,8 @@ const RichEditorPane = ({
   const {
     clearMarkdownSnapshot,
     handleMarkdownModeChange,
+    handleMarkdownSourceReady,
+    getMarkdownSource,
     hydrateMarkdownSource,
     isMarkdownMode,
     markdownModeSnapshotRef,
@@ -1360,22 +1426,56 @@ const RichEditorPane = ({
     effectiveReadOnly: readOnly || (isMobileViewport && !mobileEditingActive),
     getMemoId: () => memoRef.current?.id,
     hydratingRef,
+    onUnsafeRichTableEdit: setRichTableEditBlocked,
   });
   const useMarkdownSourceEditor = !useMobilePlainTextEditor && isMarkdownMode;
+
+  const applyPropertyFields = useCallback((source: string | null) => {
+    if (source === null || hydratingRef.current) return;
+    const fields = memoFieldsRef.current;
+    if (fields.memoId !== memoRef.current?.id) return;
+    const properties = parseNoteProperties(source);
+    if (!properties.values) return;
+    const mapped = getMappedNoteProperties(properties.values);
+    const next = { ...fields, ...(mapped.title !== undefined ? { title: mapped.title } : {}),
+      ...(mapped.tags !== undefined ? { tagsText: mapped.tags.join(", ") } : {}) };
+    if (next.title === fields.title && next.tagsText === fields.tagsText) return;
+    memoFieldsRef.current = next;
+    setMemoFields(next);
+  }, []);
+
+  const updatePropertyField = (name: string, value: unknown) => {
+    if (!isEditorReady(editor)) return;
+    const source = useMarkdownSourceEditor ? splitMarkdownFrontMatter(getMarkdownSource())?.source ?? null
+      : getFrontMatterSource(editor.getJSON() as TiptapDoc);
+    if (source === null) return;
+    const properties = parseNoteProperties(source);
+    if (!properties.values || !Object.hasOwn(properties.values, name)) return;
+    const next = updateNoteProperty(source, name, value);
+    if (useMarkdownSourceEditor) {
+      const split = splitMarkdownFrontMatter(getMarkdownSource())!;
+      const markdown = `---\n${next}\n---\n${split.body}`;
+      setMarkdownSource(markdown);
+      markdownSourceEditorRef.current?.replaceDocument(markdown);
+    } else {
+      const node = editor.state.doc.firstChild!;
+      editor.view.dispatch(editor.state.tr.insertText(next, 1, node.nodeSize - 1));
+    }
+  };
 
   const uploadMarkdownPasteFiles = useCallback(async (files: File[]) => {
     const targetMemoId = memoRef.current?.id;
     if (!targetMemoId || effectiveReadOnly) return "";
     setImageUploadState("uploading");
     const results = await processFileUploadBatch(files, async (file) => {
-      const shouldCompress = SUPPORTED_PASTE_IMAGE_TYPES.has(file.type) && imageCompressionEnabledRef.current;
+      const shouldCompress = SUPPORTED_PASTE_IMAGE_TYPES.has(resolveResourceUploadMimeType(file.name, file.type)) && imageCompressionEnabledRef.current;
       if (!shouldCompress) return file;
       setImageUploadState("compressing");
       return (await compressImageForUpload(file)).file;
     }, async (uploadFile, file) => {
       if (memoRef.current?.id !== targetMemoId) throw new Error("The active note changed during upload");
       setImageUploadState("uploading");
-      return uploadEditorResource(targetMemoId, uploadFile, SUPPORTED_PASTE_IMAGE_TYPES.has(file.type));
+      return uploadEditorResource(targetMemoId, uploadFile, SUPPORTED_PASTE_IMAGE_TYPES.has(resolveResourceUploadMimeType(file.name, file.type)));
     });
     if (results.some((result) => result.status === "fulfilled")) {
       void queryClient.invalidateQueries({ queryKey: ["resources"] });
@@ -1421,7 +1521,7 @@ const RichEditorPane = ({
       .focus()
       .insertContent({
         type: "text",
-        text: selectedText || target.title || t("common.untitledMemo"),
+        text: selectedText || getMemoDisplayTitle(target.title, t("common.untitledMemo")),
         marks: [{ type: "link", attrs: { href: createMemoLinkHref(target.id), class: "edgeever-note-link" } }],
       })
       .run();
@@ -1809,7 +1909,13 @@ const RichEditorPane = ({
   useEffect(() => {
     setNoteLinkHintPosition(null);
     resetResourceActions();
+    setAttachmentTranscript(null);
   }, [memo?.id, isMarkdownMode, resetResourceActions]);
+
+  useEffect(() => () => {
+    attachmentTranscriptAbortRef.current?.abort();
+    attachmentTranscriptAbortRef.current = null;
+  }, [memo?.id, isMarkdownMode]);
 
   useEffect(() => () => {
     if (resourceMenuHideTimerRef.current !== null) {
@@ -1881,6 +1987,8 @@ const RichEditorPane = ({
 
   const {
     closeReplace: closeNoteReplace,
+    highlightQuery: noteSearchHighlightQuery,
+    highlightIndex: noteSearchHighlightIndex,
     closeSearch: closeNoteSearch,
     inputRef: noteSearchInputRef,
     matchLabel: noteSearchMatchLabel,
@@ -1898,6 +2006,9 @@ const RichEditorPane = ({
     setQuery: setNoteSearchQuery,
     setReplacement: setNoteSearchReplacement,
   } = useEditorNoteSearchController({
+    markdownMode: useMarkdownSourceEditor,
+    markdownSource,
+    markdownSourceEditorRef,
     contentSearchQuery,
     dirtyVersion,
     editor,
@@ -1945,14 +2056,14 @@ const RichEditorPane = ({
   );
 
   const persistCurrentDraft = useCallback(
-    (nextTitle = title, nextTagsText = tagsText, nextMobilePlainText = getMobilePlainTextValue()) => {
+    (nextTitle = memoFieldsRef.current.title, nextTagsText = memoFieldsRef.current.tagsText, nextMobilePlainText = getMobilePlainTextValue()) => {
       const currentMemo = memoRef.current;
       const currentEditor = editorRef.current;
 
       if (
         !currentMemo ||
         currentMemo.isDeleted ||
-        !getWritableEditorMemoFields(memoFields, currentMemo.id, hydratedMemoIdRef.current, hydratingRef.current) ||
+        !getWritableEditorMemoFields(memoFieldsRef.current, currentMemo.id, hydratedMemoIdRef.current, hydratingRef.current) ||
         (!useMobilePlainTextEditor && !isEditorReady(currentEditor))
       ) {
         return Promise.resolve();
@@ -1974,8 +2085,9 @@ const RichEditorPane = ({
         updatedAt: new Date().toISOString(),
       });
     },
-    [getMobilePlainTextValue, markdownSource, memoFields, tagsText, title, useMarkdownSourceEditor, useMobilePlainTextEditor]
+    [getMobilePlainTextValue, markdownSource, useMarkdownSourceEditor, useMobilePlainTextEditor]
   );
+  persistResourceInsertionDraftRef.current = () => persistCurrentDraft();
 
   const markDirty = useCallback(() => {
     const currentMemo = memoRef.current;
@@ -1983,13 +2095,13 @@ const RichEditorPane = ({
       hydratingRef.current ||
       currentMemo?.isDeleted ||
       !currentMemo ||
-      !getWritableEditorMemoFields(memoFields, currentMemo.id, hydratedMemoIdRef.current, hydratingRef.current)
+      !getWritableEditorMemoFields(memoFieldsRef.current, currentMemo.id, hydratedMemoIdRef.current, hydratingRef.current)
     ) {
       return;
     }
 
     markDirtyStatus();
-  }, [markDirtyStatus, memoFields]);
+  }, [markDirtyStatus]);
 
   const getCurrentMarkdownForAi = useCallback(() => {
     if (useMobilePlainTextEditor) return getMobilePlainTextValue();
@@ -2572,7 +2684,11 @@ const RichEditorPane = ({
       return;
     }
 
+    let previousProperties = getFrontMatterSource(editor.getJSON() as TiptapDoc);
     const persistDraft = () => {
+      const source = getFrontMatterSource(editor.getJSON() as TiptapDoc);
+      if (source !== previousProperties) applyPropertyFields(source);
+      previousProperties = source;
       if (hydratingRef.current || memoRef.current?.isDeleted) {
         return;
       }
@@ -2584,7 +2700,7 @@ const RichEditorPane = ({
     return () => {
       editor.off("update", persistDraft);
     };
-  }, [editor, markDirty, memo, persistCurrentDraft]);
+  }, [applyPropertyFields, editor, markDirty, memo, persistCurrentDraft]);
 
   useEffect(() => {
     const advanceMemoSyncBase = (syncedMemo: MemoDetail | null | undefined) => {
@@ -2672,9 +2788,21 @@ const RichEditorPane = ({
   }, []);
 
   const handleMarkdownSourceChange = useCallback((value: string) => {
-    setMarkdownSource(value);
+    if (revertingUnsafeMarkdownRef.current) return;
+    const previousProperties = splitMarkdownFrontMatter(getMarkdownSource())?.source ?? null;
+    if (!setMarkdownSource(value)) {
+      revertingUnsafeMarkdownRef.current = true;
+      try {
+        markdownSourceEditorRef.current?.replaceDocument(getMarkdownSource());
+      } finally {
+        revertingUnsafeMarkdownRef.current = false;
+      }
+      return;
+    }
+    const properties = splitMarkdownFrontMatter(value)?.source ?? null;
+    if (properties !== previousProperties) applyPropertyFields(properties);
     markDirty();
-  }, [markDirty]);
+  }, [applyPropertyFields, getMarkdownSource, markDirty, setMarkdownSource]);
 
   const {
     handleCopyToWeChat,
@@ -2744,6 +2872,14 @@ const RichEditorPane = ({
   const saveMutation = useMutation({
     mutationFn: async () => {
       const currentMemo = memoRef.current;
+      if (useMarkdownSourceEditor && analyzeMarkdownModeContent(
+        markdownModeSnapshotRef.current,
+        currentMemo?.id,
+        markdownSource,
+      ).hasUnsafeRichTableEdit) {
+        setRichTableEditBlocked(true);
+        throw new Error("Rich table cell cannot be safely converted from Markdown");
+      }
       const contentJson = getCurrentContentJson();
       const editSession = editSessionRef.current;
       const writableFields = getWritableEditorMemoFields(
@@ -2878,6 +3014,7 @@ const RichEditorPane = ({
       }
 
       setSaveConflictInfo(null);
+      setSaveErrorReasonKey(failure.reasonKey);
       setSaveState("error");
     },
   });
@@ -3088,6 +3225,89 @@ const RichEditorPane = ({
     clearResourceActionError();
     downloadResourceDirectly(target);
   }, [clearResourceActionError, downloadResourceDirectly, hideResourceMenu]);
+
+  const handleResourceTranscribe = useCallback(async (target: ResourceMenuTarget) => {
+    const currentMemoId = memoRef.current?.id;
+    if (!currentMemoId || target.kind !== "attachment" || !target.resourceId) return;
+    attachmentTranscriptAbortRef.current?.abort();
+    const controller = new AbortController();
+    attachmentTranscriptAbortRef.current = controller;
+    hideResourceMenu();
+    setAttachmentTranscript({ memoId: currentMemoId, target, text: "", loading: true, completedSegments: 0, error: null });
+    try {
+      const { transcribeNoteResource } = await import("@/lib/transcribe-note-resource");
+      const result = await transcribeNoteResource(currentMemoId, target.resourceId, controller.signal, (completedSegments) => {
+        if (attachmentTranscriptAbortRef.current !== controller) return;
+        setAttachmentTranscript((current) => current?.memoId === currentMemoId && current.target.element === target.element
+          ? { ...current, completedSegments }
+          : current);
+      });
+      if (attachmentTranscriptAbortRef.current !== controller) return;
+      const activeEditor = editorRef.current;
+      if (result.text.trim() && activeEditor?.isEditable && memoRef.current?.id === currentMemoId) {
+        try {
+          if (insertTranscriptAfterAttachment(
+            activeEditor,
+            target,
+            result.text,
+            t("speechTranscription.resultTitle"),
+            target.element,
+          )) {
+            setAttachmentTranscript(null);
+            return;
+          }
+        } catch {
+          // Keep the recognized text available in the inline card if insertion fails.
+        }
+      }
+      setAttachmentTranscript((current) => current?.memoId === currentMemoId && current.target.element === target.element
+        ? { ...current, text: result.text, loading: false,
+          error: result.text.trim() ? null : t("speechTranscription.recognizeFailed") }
+        : current);
+    } catch (error) {
+      if (attachmentTranscriptAbortRef.current !== controller || controller.signal.aborted) return;
+      setAttachmentTranscript((current) => current?.memoId === currentMemoId && current.target.element === target.element
+        ? { ...current, loading: false, error: error instanceof SpeechProviderReachabilityError
+          ? t(error.platform === "browser"
+            ? "speechTranscription.browserDirectUnavailable" : "speechTranscription.desktopDirectUnavailable")
+          : error instanceof Error ? error.message : t("speechTranscription.recognizeFailed") }
+        : current);
+    } finally {
+      if (attachmentTranscriptAbortRef.current === controller) attachmentTranscriptAbortRef.current = null;
+    }
+  }, [hideResourceMenu, t]);
+
+  const dismissAttachmentTranscript = useCallback(() => {
+    attachmentTranscriptAbortRef.current?.abort();
+    attachmentTranscriptAbortRef.current = null;
+    setAttachmentTranscript(null);
+  }, []);
+
+  const retryAttachmentTranscript = useCallback(() => {
+    if (attachmentTranscript) void handleResourceTranscribe(attachmentTranscript.target);
+  }, [attachmentTranscript, handleResourceTranscribe]);
+
+  const insertAttachmentTranscript = useCallback(() => {
+    const activeEditor = editorRef.current;
+    if (!activeEditor?.isEditable || !attachmentTranscript?.text ||
+      attachmentTranscript.memoId !== memoRef.current?.id) return;
+    if (insertTranscriptAfterAttachment(
+      activeEditor,
+      attachmentTranscript.target,
+      attachmentTranscript.text,
+      t("speechTranscription.resultTitle"),
+      attachmentTranscript.target.element,
+    )) setAttachmentTranscript(null);
+  }, [attachmentTranscript, t]);
+
+  const attachmentTranscriptContext = useMemo<AttachmentTranscriptContextValue>(() => ({
+    transcript: attachmentTranscript?.memoId === memo?.id ? attachmentTranscript : null,
+    canInsert: Boolean(editor?.isEditable && !effectiveReadOnly && !useMarkdownSourceEditor && !useMobilePlainTextEditor),
+    onDismiss: dismissAttachmentTranscript,
+    onRetry: retryAttachmentTranscript,
+    onInsert: insertAttachmentTranscript,
+  }), [attachmentTranscript, dismissAttachmentTranscript, editor?.isEditable, effectiveReadOnly,
+    insertAttachmentTranscript, memo?.id, retryAttachmentTranscript, useMarkdownSourceEditor, useMobilePlainTextEditor]);
 
   const handleResourceSaveAs = useCallback(async (target: ResourceMenuTarget) => {
     hideResourceMenu();
@@ -3361,6 +3581,8 @@ const RichEditorPane = ({
     tagsText,
     title,
   });
+  const saveStatusReason = saveConflictReason
+    ?? (saveState === "error" && saveErrorReasonKey ? t(saveErrorReasonKey) : null);
 
   useLayoutEffect(() => {
     const title = headerTitleSlot;
@@ -3576,6 +3798,7 @@ const RichEditorPane = ({
   const resourceMenuLabels = {
     download: t("editor.resourceActions.download"),
     saveAs: t("editor.resourceActions.saveAs"),
+    transcribe: t("editor.resourceActions.transcribe"),
     rename: t("editor.resourceActions.rename"),
     delete: t("editor.resourceActions.delete"),
     unavailable: t("editor.resourceActions.unavailable"),
@@ -3597,9 +3820,6 @@ const RichEditorPane = ({
       };
 
   const editorColumnMatchesArticle = !useMarkdownSourceEditor;
-  const contentColumnMode = desktopFocusMode ? "focus" : editorOutlineCollapsed ? "collapsed" : "reading";
-  const contentColumnMaxWidth = editorContentColumnMaxWidth(editorContentWidth, contentColumnMode);
-  const focusTitleMaxWidth = editorContentColumnMaxWidth(editorContentWidth, "focus");
   const editorPaneTight = editorColumnWidth > 0 && editorColumnWidth < EDITOR_PANE_TIGHT_PX;
   const outlineReservesSpace = !editorPaneTight
     && !isMobileViewport
@@ -3611,7 +3831,7 @@ const RichEditorPane = ({
     aiAssistantOpen,
     desktopColumn: isDesktopColumn,
     columnWidth: Math.max(0, editorColumnWidth - editorScrollbarGutter * 2),
-    articleMaxWidth: Number.parseInt(contentColumnMaxWidth, 10),
+    articleMaxWidth: Number.parseInt(EDITOR_CONTENT_MAX_WIDTH, 10),
     reservedBesideArticle: outlineReservesSpace
       ? Number.parseInt(EDITOR_OUTLINE_WIDTH, 10) + EDITOR_ARTICLE_ROW_GAP_PX
       : 0,
@@ -3687,17 +3907,17 @@ const RichEditorPane = ({
             style={editorColumnMatchesArticle && editorScrollbarGutter > 0 ? { paddingRight: editorScrollbarGutter } : undefined}
           >
           <div
+            ref={setHeaderTitleSlot}
             className={cn(
               "min-w-0 w-full",
               isDesktopColumn && desktopFocusMode && "mx-auto",
             )}
             style={{
-              ...(isDesktopColumn && desktopFocusMode ? { maxWidth: focusTitleMaxWidth } : {}),
+              ...(isDesktopColumn && desktopFocusMode ? { maxWidth: EDITOR_CONTENT_MAX_WIDTH } : {}),
               ...(titleStatusClearancePx > 0 ? { paddingRight: titleStatusClearancePx } : {}),
             }}
           >
           <div
-            ref={setHeaderTitleSlot}
             className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 sm:flex-nowrap"
           >
           <MemoEditorTopRowLeading
@@ -3720,9 +3940,11 @@ const RichEditorPane = ({
                 value={title}
                 readOnly={effectiveReadOnly}
                 onValueChange={(nextTitle) => {
+                  if (memoFieldsRef.current.memoId === memo.id) memoFieldsRef.current = { ...memoFieldsRef.current, title: nextTitle };
                   setMemoFields((fields) => fields.memoId === memo.id
                     ? { ...fields, title: nextTitle }
                     : fields);
+                  updatePropertyField("title", nextTitle);
                   persistCurrentDraft(nextTitle, tagsText, getMobilePlainTextValue());
                   markDirty();
                 }}
@@ -3744,9 +3966,11 @@ const RichEditorPane = ({
             onMobileNotebookPickerOpenChange={setMobileNotebookSheetOpen}
             onNotebookChange={handleNotebookChange}
             onTagsChange={(nextTagsText) => {
+              if (memoFieldsRef.current.memoId === memo.id) memoFieldsRef.current = { ...memoFieldsRef.current, tagsText: nextTagsText };
               setMemoFields((fields) => fields.memoId === memo.id
                 ? { ...fields, tagsText: nextTagsText }
                 : fields);
+              updatePropertyField("tags", parseTagsText(nextTagsText));
               persistCurrentDraft(title, nextTagsText, getMobilePlainTextValue());
               markDirty();
             }}
@@ -3797,16 +4021,17 @@ const RichEditorPane = ({
                     : t("editor.uploadState.fileUploading")}
               </span>
             )}
-            <IconTooltip label={saveConflictReason ? `${saveStatusLabel}. ${saveConflictReason}` : saveStatusLabel}>
+            <IconTooltip label={saveStatusReason ? `${saveStatusLabel}. ${saveStatusReason}` : saveStatusLabel}>
             <m.span
               key={`${saveState}-${String(hasUnsavedChanges)}`}
+              tabIndex={0}
               className={cn(
                 "hidden items-center gap-1 rounded-md text-xs font-medium sm:inline-flex",
                 savedQuietly ? "px-1 text-slate-400" : cn("px-1.5 py-0.5", saveStateClassName),
               )}
               role="status"
               aria-live="polite"
-              aria-label={saveState === "conflict" && saveConflictReason ? `${saveStatusLabel}. ${saveConflictReason}` : saveStatusLabel}
+              aria-label={saveStatusReason ? `${saveStatusLabel}. ${saveStatusReason}` : saveStatusLabel}
               {...statusSettleMotion}
             >
               {saveState === "saving" ? (
@@ -3821,17 +4046,19 @@ const RichEditorPane = ({
               {savedQuietly ? null : saveLabel}
             </m.span>
             </IconTooltip>
+            <IconTooltip label={saveStatusReason ? `${mobileStatusLabel}. ${saveStatusReason}` : mobileStatusLabel}>
             <m.span
               key={`${imageUploadState}-${saveState}-${String(hasUnsavedChanges)}`}
+              tabIndex={0}
               className={cn("inline-flex max-w-[5.5rem] truncate rounded-full px-2 py-1 text-xs font-medium sm:hidden", mobileStatusClassName)}
               role="status"
               aria-live="polite"
-              title={saveConflictReason ?? undefined}
-              aria-label={saveState === "conflict" && saveConflictReason ? `${saveLabel}. ${saveConflictReason}` : undefined}
+              aria-label={saveStatusReason ? `${mobileStatusLabel}. ${saveStatusReason}` : mobileStatusLabel}
               {...statusSettleMotion}
             >
               {mobileStatusLabel}
             </m.span>
+            </IconTooltip>
             </div>
             <MemoEditorToolbarDivider className="mx-0.5 hidden h-4 sm:block" />
             <div className="flex items-center gap-0.5">
@@ -3842,12 +4069,7 @@ const RichEditorPane = ({
             {!readOnly && (!mobileEditingActive || isMemoShared) && (
               <IconTooltip label={t(isLocalMemoId(memo.id) ? "sharing.afterSync" : isMemoShared ? "sharing.manage" : "sharing.action")}>
                 <Button
-                  className={cn(
-                    "h-8 w-8",
-                    isMemoShared
-                      ? "bg-[#d4d4d4] text-[#2a2a2a] hover:bg-[#e4e4e4] hover:text-[#2a2a2a]"
-                      : "text-slate-500",
-                  )}
+                  className="h-8 w-8 text-slate-500"
                   size="icon"
                   variant="ghost"
                   type="button"
@@ -3856,7 +4078,7 @@ const RichEditorPane = ({
                   disabled={isLocalMemoId(memo.id)}
                   onClick={() => setShareOpen(true)}
                 >
-                  <Share2 className="h-4 w-4" aria-hidden="true" />
+                  {isMemoShared ? <Globe className="h-4 w-4" aria-hidden="true" /> : <Share2 className="h-4 w-4" aria-hidden="true" />}
                 </Button>
               </IconTooltip>
             )}
@@ -3915,6 +4137,11 @@ const RichEditorPane = ({
               onSearch={() => openNoteSearch()}
               textNoteMenuItems={(
                 <>
+                  {onCreatePoster && !effectiveReadOnly && <DropdownMenuItem disabled={!memo || saveMutation.isPending} onSelect={() => {
+                    const selection = editor?.state.selection;
+                    const text = selection && !selection.empty ? editor?.state.doc.textBetween(selection.from, selection.to, "\n") ?? "" : editor?.getText() ?? memo?.contentText ?? "";
+                    void (async () => { if (!memo) return; if (hasUnsavedChangesRef.current) await saveMutation.mutateAsync(); await onCreatePoster(memoRef.current ?? memo, text); })().catch(() => setSaveState("error"));
+                  }}>{t("poster.createFromNote")}</DropdownMenuItem>}
                   {!isMobileViewport && !useMobilePlainTextEditor && !useMarkdownSourceEditor && (
                     <DropdownMenuItem
                       className="flex h-9 w-full items-center gap-2 px-3 text-left text-xs text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
@@ -3973,13 +4200,30 @@ const RichEditorPane = ({
                   <DropdownMenuItem
                     className={cn(
                       "flex h-9 w-full items-center gap-2 px-3 text-left text-xs hover:bg-slate-50 cursor-pointer outline-none",
-                      isMemoShared ? "bg-workspace-selection text-slate-950" : "text-slate-700",
+                      isMemoShared ? "text-slate-950" : "text-slate-700",
                     )}
                     disabled={isLocalMemoId(memo.id)}
                     onClick={() => setShareOpen(true)}
                   >
-                    <Share2 className={cn("h-4 w-4", isMemoShared ? "text-slate-950" : "text-slate-500")} />
+                    {isMemoShared ? <Globe className="h-4 w-4 text-slate-950" /> : <Share2 className="h-4 w-4 text-slate-500" />}
                     {t(isLocalMemoId(memo.id) ? "sharing.afterSync" : isMemoShared ? "sharing.manage" : "sharing.action")}
+                  </DropdownMenuItem>
+                )}
+                {!readOnly && onDuplicateMemo && (
+                  <DropdownMenuItem
+                    className="flex h-9 w-full items-center gap-2 px-3 text-left text-xs text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
+                    // The server copies the saved note, so wait until every edit is saved.
+                    disabled={
+                      isLocalMemoId(memo.id)
+                      || hasUnsavedChanges
+                      || saveMutationPending
+                      || saveState === "conflict"
+                      || saveState === "error"
+                    }
+                    onClick={() => onDuplicateMemo(memo)}
+                  >
+                    <CopyPlus className="h-4 w-4 text-slate-500" />
+                    {t("editor.duplicate")}
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuItem
@@ -4155,7 +4399,7 @@ const RichEditorPane = ({
               useMarkdownSourceEditor && "flex h-full min-h-0 flex-col",
               isDesktopColumn && "mx-auto",
             )}
-            style={isDesktopColumn ? { maxWidth: contentColumnMaxWidth } : undefined}
+            style={isDesktopColumn ? { maxWidth: EDITOR_CONTENT_MAX_WIDTH } : undefined}
           >
             {useMobilePlainTextEditor ? (
               <>
@@ -4170,7 +4414,7 @@ const RichEditorPane = ({
                   enterKeyHint="enter"
                   inputMode="text"
                   name="memo-body"
-                  spellCheck
+                  spellCheck={spellcheckEnabled}
                   data-edgeever-mobile-editor="plain-textarea"
                   aria-label={t("editor.noteBodyAria")}
                   className="block min-h-[60dvh] w-full resize-none border border-slate-200 bg-card px-4 py-3 pr-32 text-base leading-7 text-slate-950 outline-none placeholder:text-slate-400 sm:px-7"
@@ -4202,10 +4446,17 @@ const RichEditorPane = ({
               </>
             ) : useMarkdownSourceEditor ? (
               <div ref={markdownMenuAnchorRef} className="relative min-h-0 flex-1">
+                {richTableEditBlocked ? (
+                  <div role="alert" className="absolute inset-x-3 bottom-3 z-50 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950 shadow-sm dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+                    {t("editor.richTableSourceProtection")}
+                  </div>
+                ) : null}
                 <Suspense fallback={<div className="h-full w-full" />}>
                   <MarkdownSourceEditor
                     ref={markdownSourceEditorRef}
                     memoId={memo?.id ?? ""}
+                    searchQuery={noteSearchHighlightQuery}
+                    searchIndex={noteSearchHighlightIndex}
                     value={markdownSource}
                     onChange={handleMarkdownSourceChange}
                     onPasteFiles={uploadMarkdownPasteFiles}
@@ -4218,6 +4469,7 @@ const RichEditorPane = ({
                     }}
                     onLinkShortcut={openExternalLinkDialog}
                     onSelectionChange={syncMarkdownAiMenu}
+                    onReady={handleMarkdownSourceReady}
                     className="absolute inset-0 h-full w-full"
                   />
                 </Suspense>
@@ -4257,10 +4509,11 @@ const RichEditorPane = ({
                     onAsk={() => requestSelectionAi("ask")}
                   />
                 </BubbleMenu>
-                {!isMobileViewport && !effectiveReadOnly && isEditorReady(editor) ? (
-                  <EditorBlockDragHandle editor={editor} />
-                ) : null}
-                <EditorContent editor={editor} />
+                <EditorTableContextMenu editor={editor} readOnly={effectiveReadOnly}>
+                  <AttachmentTranscriptContext.Provider value={attachmentTranscriptContext}>
+                    <EditorContent editor={editor} />
+                  </AttachmentTranscriptContext.Provider>
+                </EditorTableContextMenu>
               </div>
             )}
           </div>
@@ -4318,9 +4571,17 @@ const RichEditorPane = ({
               resourceMenuTarget.resourceId && !resourceMenuTarget.resourceId.startsWith("local_resource_")
             ))
           )}
+          canTranscribe={Boolean(
+            memo?.id &&
+            resourceMenuTarget.kind === "attachment" &&
+            resourceMenuTarget.resourceId &&
+            !resourceMenuTarget.resourceId.startsWith("local_resource_") &&
+            /\.(flac|mp3|mp4|mpeg|mpga|m4a|ogg|wav|webm)$/i.test(resourceMenuTarget.filename)
+          )}
           labels={resourceMenuLabels}
           onDownload={() => void handleResourceDownload(resourceMenuTarget)}
           onSaveAs={() => void handleResourceSaveAs(resourceMenuTarget)}
+          onTranscribe={() => void handleResourceTranscribe(resourceMenuTarget)}
           onRename={() => openResourceDialog("rename", resourceMenuTarget)}
           onDelete={() => openResourceDialog("delete", resourceMenuTarget)}
           onMouseEnter={cancelResourceMenuHide}
@@ -4369,7 +4630,7 @@ const RichEditorPane = ({
               // The phone note view already has an edit button in this corner.
               isMobileViewport && !mobileEditingActive
                 ? "bottom-[calc(4.75rem+env(safe-area-inset-bottom))] right-4"
-                : "bottom-[calc(1.25rem+env(safe-area-inset-bottom))] right-5",
+                : AI_ASSISTANT_LAUNCHER_POSITION,
             )}
             aria-label={t("aiAssistant.open")}
             onClick={openAiAssistant}

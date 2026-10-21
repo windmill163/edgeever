@@ -1,9 +1,15 @@
-import { forwardRef, useCallback, useImperativeHandle, useMemo, useRef, type ClipboardEvent as ReactClipboardEvent } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, type ClipboardEvent as ReactClipboardEvent } from "react";
 import CodeMirror, {
   EditorView,
+  Decoration,
+  ViewPlugin,
+  type DecorationSet,
+  type ViewUpdate,
   type ReactCodeMirrorRef,
   type Extension,
 } from "@uiw/react-codemirror";
+import { isolateHistory } from "@codemirror/commands";
+import { getMarkdownReplacementChanges, getMarkdownSearchMatches } from "./markdown-source-search";
 import { markdown } from "@codemirror/lang-markdown";
 import {
   githubLightInit,
@@ -35,6 +41,8 @@ export interface MarkdownSourceEditorRef {
   getScrollContainer: () => HTMLElement | null;
   getSelection: () => { from: number; to: number };
   setSelection: (from: number, to: number) => void;
+  replaceDocument: (value: string) => void;
+  replaceSearchMatches: (query: string, replacement: string) => void;
   focus: () => void;
   insertText: (text: string, from?: number, to?: number) => void;
   sliceText: (from: number, to: number) => string;
@@ -55,6 +63,9 @@ export interface MarkdownSourceEditorProps {
   onSlashCommandTrigger?: (commandStart: number) => void;
   onLinkShortcut?: () => void;
   onSelectionChange?: () => void;
+  onReady?: () => void;
+  searchQuery?: string;
+  searchIndex?: number;
 }
 
 export const CODE_MIRROR_THEME_MAP: Record<MarkdownThemeName, Extension> = {
@@ -96,7 +107,7 @@ const baseEditorTheme = EditorView.theme({
   },
   "@media (min-width: 1024px)": {
     ".cm-scroller": {
-      scrollbarGutter: "stable both-edges",
+      scrollbarGutter: "stable",
     },
   },
   ".cm-line": {
@@ -126,6 +137,9 @@ export const MarkdownSourceEditor = forwardRef<MarkdownSourceEditorRef, Markdown
       onSlashCommandTrigger,
       onLinkShortcut,
       onSelectionChange,
+      onReady,
+      searchQuery = "",
+      searchIndex = 0,
     },
     ref,
   ) => {
@@ -135,6 +149,22 @@ export const MarkdownSourceEditor = forwardRef<MarkdownSourceEditorRef, Markdown
     const pendingPastesRef = useRef(new Set<PendingPaste>());
     const onSelectionChangeRef = useRef(onSelectionChange);
     onSelectionChangeRef.current = onSelectionChange;
+
+    useEffect(() => {
+      let frame = 0;
+      let cancelled = false;
+      let attempts = 0;
+      const notifyWhenReady = () => {
+        if (cancelled) return;
+        if (cmRef.current?.view) onReady?.();
+        else if (attempts++ < 120) frame = window.requestAnimationFrame(notifyWhenReady);
+      };
+      notifyWhenReady();
+      return () => {
+        cancelled = true;
+        window.cancelAnimationFrame(frame);
+      };
+    }, [onReady]);
 
     useImperativeHandle(
       ref,
@@ -159,6 +189,21 @@ export const MarkdownSourceEditor = forwardRef<MarkdownSourceEditorRef, Markdown
           view.dispatch({
             selection: { anchor: safeFrom, head: safeTo },
             scrollIntoView: true,
+          });
+        },
+        replaceSearchMatches: (query: string, replacement: string) => {
+          const view = cmRef.current?.view;
+          if (!view || view.state.readOnly) return;
+          const changes = getMarkdownReplacementChanges(view.state.doc, query, replacement);
+          if (changes.length) view.dispatch({ changes, userEvent: "input.replace", annotations: isolateHistory.of("full") });
+        },
+        replaceDocument: (value: string) => {
+          const view = cmRef.current?.view;
+          if (!view || view.state.doc.toString() === value) return;
+          const anchor = Math.min(view.state.selection.main.anchor, value.length);
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: value },
+            selection: { anchor },
           });
         },
         focus: () => {
@@ -208,6 +253,19 @@ export const MarkdownSourceEditor = forwardRef<MarkdownSourceEditorRef, Markdown
 
     const extensions = useMemo(() => {
       return [
+        ViewPlugin.fromClass(class {
+          decorations: DecorationSet;
+          constructor(view: EditorView) { this.decorations = this.highlight(view); }
+          update(update: ViewUpdate) {
+            if (update.docChanged) this.decorations = this.highlight(update.view);
+          }
+          highlight(view: EditorView) {
+            return Decoration.set(getMarkdownSearchMatches(view.state.doc, searchQuery).map((match, index) =>
+              Decoration.mark({ class: index === searchIndex
+                ? "edgeever-search-match edgeever-search-match-active"
+                : "edgeever-search-match" }).range(match.from, match.to)), true);
+          }
+        }, { decorations: (plugin) => plugin.decorations }),
         markdown(),
         EditorView.lineWrapping,
         baseEditorTheme,
@@ -221,7 +279,7 @@ export const MarkdownSourceEditor = forwardRef<MarkdownSourceEditorRef, Markdown
           if (update.selectionSet || update.docChanged) onSelectionChangeRef.current?.();
         }),
       ];
-    }, []);
+    }, [searchQuery, searchIndex]);
 
     const handlePasteCapture = useCallback((event: ReactClipboardEvent<HTMLDivElement>) => {
       if (readOnly || !onPasteFiles) return;
@@ -350,7 +408,7 @@ export const MarkdownSourceEditor = forwardRef<MarkdownSourceEditorRef, Markdown
             // lights up later list items and looks like extra selection.
             highlightSelectionMatches: false,
             closeBracketsKeymap: true,
-            searchKeymap: true,
+            searchKeymap: false,
             foldKeymap: false,
             completionKeymap: false,
             lintKeymap: false,

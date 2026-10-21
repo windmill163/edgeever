@@ -3,19 +3,20 @@ import {
   createEdgeEverDocumentExtensions,
   type CreateEdgeEverDocumentExtensionsOptions,
 } from "./document-extensions";
-import { MergeDivider, MERGE_DIVIDER_NODE_TYPE } from "./merge-divider";
-import { PdfAttachment, PDF_ATTACHMENT_NODE_TYPE, upgradeStandalonePdfLinks } from "./pdf-attachment";
-import { FileAttachment, FILE_ATTACHMENT_NODE_TYPE, upgradeStandaloneFileLinks } from "./file-attachment";
+import { MERGE_DIVIDER_NODE_TYPE } from "./merge-divider";
+import { PDF_ATTACHMENT_NODE_TYPE, upgradeStandalonePdfLinks } from "./pdf-attachment";
+import { FILE_ATTACHMENT_NODE_TYPE, upgradeStandaloneFileLinks } from "./file-attachment";
 import {
   BLOCK_MATH_NODE_TYPE,
   createEdgeEverMarkdownMathematics,
   INLINE_MATH_NODE_TYPE,
 } from "./mathematics-markdown";
 import { projectNativeUnknownContentForMarkdown } from "./mobile-content-compatibility";
-import { PluginEmbed, PLUGIN_EMBED_NODE_TYPE } from "./plugin-embed";
+import { PLUGIN_EMBED_NODE_TYPE } from "./plugin-embed";
 import { NEW_IMAGE_WIDTH_PERCENT, parseImageWidth } from "./image-display";
-import { ImageGallery, IMAGE_GALLERY_NODE_TYPE, groupConsecutiveImagesIntoGalleries, normalizeImageGalleries } from "./image-gallery";
+import { IMAGE_GALLERY_NODE_TYPE, groupConsecutiveImagesIntoGalleries, normalizeImageGalleries } from "./image-gallery";
 import { EMPTY_EXTERNAL_LINK_NODE_TYPE } from "./empty-external-link";
+import { FRONT_MATTER_LANGUAGE, createFrontMatterNode, getFrontMatterSource, splitMarkdownFrontMatter } from "./front-matter";
 
 export { PluginEmbed, PLUGIN_EMBED_NODE_TYPE, pluginEmbedToMarkdown, normalizePluginEmbedAttributes } from "./plugin-embed";
 export type { PluginEmbedAttributes } from "./plugin-embed";
@@ -76,6 +77,15 @@ export type TiptapDoc = {
 };
 
 export const DEFAULT_MEMO_TITLE = "无标题笔记";
+
+/**
+ * Title to show for a note. Untitled notes are stored with the zh-CN default
+ * title, so it is replaced by the reader's localized label like an empty one.
+ */
+export const getMemoDisplayTitle = (title: string | null | undefined, untitledLabel: string) => {
+  const trimmed = title?.trim() ?? "";
+  return trimmed && trimmed !== DEFAULT_MEMO_TITLE ? trimmed : untitledLabel;
+};
 
 export const resolveMergedMemoTitle = (
   inputTitle: string | null | undefined,
@@ -142,10 +152,13 @@ export const markdownToDoc = (markdown: string): TiptapDoc => {
     return emptyDoc();
   }
 
-  const parsed = markdownManager.parse(expandExtraBlankLinesForParse(normalized)) as TiptapDoc;
+  const header = splitMarkdownFrontMatter(normalized);
+  const parsed = markdownManager.parse(expandExtraBlankLinesForParse(header?.body ?? normalized)) as TiptapDoc;
   return {
     ...parsed,
-    content: groupConsecutiveImagesIntoGalleries(parsed.content.map(withDefaultImageWidths)),
+    content: [...(header ? [createFrontMatterNode(header.source)] : []),
+      ...groupConsecutiveImagesIntoGalleries(parsed.content.map(withDefaultImageWidths)),
+      ...(header && !parsed.content.length ? [{ type: "paragraph" }] : [])],
   };
 };
 
@@ -155,6 +168,22 @@ const docContainsNodeType = (doc: TiptapDoc, nodeType: string): boolean => {
   );
 
   return visit(doc.content);
+};
+
+/** Upgrade only explicit math fences in older JSON, retaining rich-only content. */
+const upgradeMathCodeFences = (doc: TiptapDoc): TiptapDoc => {
+  const visit = (node: TiptapNode): TiptapNode => {
+    if (node.type === "codeBlock" && node.attrs?.language === "math"
+      && node.content?.every((child) => child.type === "text")) {
+      const latex = node.content.map((child) => (child as TiptapTextNode).text).join("").trim();
+      if (latex) return { type: BLOCK_MATH_NODE_TYPE, attrs: { latex } };
+    }
+    if (!node.content) return node;
+    const content = node.content.map(visit);
+    return content.some((child, index) => child !== node.content?.[index]) ? { ...node, content } : node;
+  };
+  const content = doc.content.map(visit);
+  return content.some((node, index) => node !== doc.content[index]) ? { ...doc, content } : doc;
 };
 
 /**
@@ -168,10 +197,11 @@ export const resolveMemoContentDoc = (
   contentMarkdown: string | null | undefined
 ): TiptapDoc => {
   const currentDoc = contentJson && Array.isArray(contentJson.content)
-    ? normalizeImageGalleries(
+    ? upgradeMathCodeFences(normalizeImageGalleries(
         upgradeStandaloneFileLinks(upgradeStandalonePdfLinks(upgradeLegacyAttachmentLinks(contentJson))),
-      )
+      ))
     : emptyDoc();
+  if (getFrontMatterSource(currentDoc) !== null) return currentDoc;
   if (
     !contentMarkdown?.trim() ||
     docContainsNodeType(currentDoc, "table") ||
@@ -191,6 +221,10 @@ export const resolveMemoContentDoc = (
   }
 
   const markdownDoc = markdownToDoc(contentMarkdown);
+  const properties = getFrontMatterSource(markdownDoc);
+  if (properties !== null) {
+    return !docToText(currentDoc) ? markdownDoc : { ...currentDoc, content: [createFrontMatterNode(properties), ...currentDoc.content] };
+  }
   // Some older saves left an empty JSON document behind while retaining the
   // real body in Markdown. Treat that as a compatibility case too; otherwise
   // the editor can show the Markdown body while list excerpts see an empty
@@ -257,6 +291,8 @@ export const docToText = (doc: unknown): string => {
     }
 
     const current = node as { type?: unknown; text?: unknown; attrs?: Record<string, unknown>; content?: unknown };
+
+    if (current.type === "codeBlock" && current.attrs?.language === FRONT_MATTER_LANGUAGE) return;
 
     if (typeof current.text === "string") {
       pieces.push(current.text);
@@ -325,6 +361,8 @@ export const countMemoCharacters = (doc: unknown): number => {
 
     const current = node as { type?: unknown; text?: unknown; attrs?: Record<string, unknown>; content?: unknown };
 
+    if (current.type === "codeBlock" && current.attrs?.language === FRONT_MATTER_LANGUAGE) return;
+
     if (typeof current.text === "string") {
       pieces.push(current.text);
     }
@@ -360,12 +398,15 @@ export const docToMarkdown = (doc: unknown): string => {
     return "";
   }
 
+  const properties = getFrontMatterSource(doc as TiptapDoc);
+  const body = properties === null ? doc : { ...doc, content: root.content.slice(1) };
   const serializableDoc = protectLiteralDollarPairs(projectNativeUnknownContentForMarkdown(
-    stripEditorOnlyNodes(doc) as TiptapDoc
+    stripEditorOnlyNodes(body) as TiptapDoc
   ));
-  return markdownManager
+  const markdown = markdownManager
     .serialize(serializableDoc as Parameters<typeof markdownManager.serialize>[0])
     .replaceAll(LITERAL_DOLLAR_PLACEHOLDER, "\\$");
+  return properties === null ? markdown : `---\n${properties}\n---\n\n${markdown}`;
 };
 
 const LITERAL_DOLLAR_PLACEHOLDER = "\uE000edgeever-dollar\uE001";
@@ -376,7 +417,9 @@ const protectLiteralDollarPairs = (value: unknown): unknown => {
     return value;
   }
 
-  const node = value as { type?: unknown; text?: unknown; content?: unknown };
+  const node = value as { type?: unknown; text?: unknown; content?: unknown; marks?: Array<{ type?: string }> };
+  // Markdown does not interpret escapes inside code; adding them changes the source.
+  if (node.type === "codeBlock" || node.marks?.some((mark) => mark.type === "code")) return value;
   if (node.type === "text" && typeof node.text === "string") {
     const dollarCount = Array.from(node.text).filter((character) => character === "$").length;
     return dollarCount >= 2

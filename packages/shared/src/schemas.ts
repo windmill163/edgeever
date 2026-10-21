@@ -1,3 +1,4 @@
+import { PUBLISHED_NOTE_BODY_FONTS } from "./sharing";
 import { z } from "zod";
 import {
   MAX_NOTE_PROSE_CSS_BYTES,
@@ -75,6 +76,9 @@ export const TemplateUpdateSchema = z.object({
 
 export const TemplateUseSchema = z.object({
   notebookId: z.string().trim().min(1),
+  // The client's UI language. Default templates nobody edited are used in
+  // this language; without it every template is used as stored.
+  locale: z.string().trim().min(1).max(64).optional(),
 });
 
 const ScheduledPluginCommandPayloadSchema = z.object({
@@ -163,6 +167,11 @@ export const DeleteMemosSchema = z.object({
   permanent: z.boolean().optional(),
 });
 
+export const DuplicateMemoSchema = z.object({
+  notebookId: z.string().trim().min(1).optional(),
+  title: z.string().trim().max(160).optional(),
+});
+
 export const MergeMemosSchema = z.object({
   memoIds: z.array(z.string().trim().min(1)).min(2).max(50),
   notebookId: z.string().trim().min(1).optional(),
@@ -173,6 +182,9 @@ export const LoginSchema = z.object({
   username: z.string().trim().min(1).max(80),
   password: z.string().min(1).max(512),
   deviceId: z.string().trim().min(16).max(160).optional(),
+  // The client's resolved UI locale. Used once, to localize a new workspace's
+  // default notebooks and notes at its first sign-in.
+  locale: z.string().trim().min(1).max(35).optional(),
 });
 
 export const LoginDeviceSessionUpdateSchema = z.object({
@@ -250,11 +262,14 @@ export const ObjectStorageConnectionTestSchema = z.object({
 
 export const AiProviderSchema = z.enum(["openai-compatible", "anthropic", "google"]);
 
-const AiBaseUrlSchema = z.string().trim().url().max(500).superRefine((value, context) => {
+export const AiTranscriptionStandardSchema = z.enum(["openai-compatible"]);
+
+const rejectUnsafeAiBaseUrl = (value: string, context: z.RefinementCtx) => {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
+    context.addIssue({ code: "custom", message: "AI Base URL must be a valid URL." });
     return;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -263,6 +278,42 @@ const AiBaseUrlSchema = z.string().trim().url().max(500).superRefine((value, con
   if (url.username || url.password) {
     context.addIssue({ code: "custom", message: "AI Base URL must not contain credentials." });
   }
+};
+
+const AiBaseUrlSchema = z.string().trim().url().max(500).superRefine(rejectUnsafeAiBaseUrl);
+
+const AiTranscriptionProviderBaseUrlSchema = z.string().trim().min(1).max(500).superRefine((value, context) => {
+  if (!z.string().url().safeParse(value).success) {
+    context.addIssue({ code: "custom", message: "AI Base URL must be a valid URL." });
+    return;
+  }
+  rejectUnsafeAiBaseUrl(value, context);
+});
+
+export const AiTranscriptionProviderCreateSchema = z.object({
+  provider: AiTranscriptionStandardSchema.default("openai-compatible"),
+  displayName: z.string().trim().min(1).max(80),
+  baseUrl: AiTranscriptionProviderBaseUrlSchema,
+  apiKey: z.string().trim().min(1).max(4096),
+  isEnabled: z.boolean().default(true),
+  initialModelId: z.string().trim().min(1).max(200).optional(),
+});
+
+export const AiTranscriptionProviderUpdateSchema = z.object({
+  provider: AiTranscriptionStandardSchema.default("openai-compatible"),
+  displayName: z.string().trim().min(1).max(80),
+  baseUrl: AiTranscriptionProviderBaseUrlSchema,
+  apiKey: z.string().trim().min(1).max(4096).optional(),
+  isEnabled: z.boolean().default(true),
+});
+
+export const AiTranscriptionModelCreateSchema = z.object({
+  modelId: z.string().trim().min(1).max(200),
+  displayName: z.string().trim().min(1).max(80).optional(),
+});
+
+export const AiTranscriptionDefaultModelUpdateSchema = z.object({
+  modelConfigId: z.string().trim().min(1).nullable(),
 });
 
 const AiProviderConfigFieldsSchema = z.object({
@@ -298,6 +349,7 @@ export const AiDefaultModelUpdateSchema = z.object({
 });
 
 export const AiAttachmentSchema = z.object({
+  // oxlint-disable-next-line no-control-regex -- rejects control characters in attachment filenames
   filename: z.string().trim().min(1).max(255).regex(/^[^\u0000-\u001F\u007F]+$/),
   mediaType: z.enum(AI_ATTACHMENT_MEDIA_TYPES),
   base64Data: z.string().min(1).max(Math.ceil(MAX_AI_ATTACHMENT_BYTES / 3) * 4),
@@ -382,12 +434,15 @@ export const AiPromptTemplateUpdateSchema = z.object({
   message: "At least one field is required.",
 });
 
-export const MemoShareUpdateSchema = z.object({
+export const SharePasswordUpdateSchema = z.object({
   passwordProtected: z.boolean(),
 });
 
+export const MemoShareUpdateSchema = SharePasswordUpdateSchema;
+export const NotebookShareUpdateSchema = SharePasswordUpdateSchema;
+
 export const NoteBodyFontUpdateSchema = z.object({
-  bodyFont: z.enum(["wenkai", "wenkai-screen", "zhuque", "source-han-serif", "neo-zhi-song", "source-han-sans", "source-serif"]).nullable(),
+  bodyFont: z.enum(PUBLISHED_NOTE_BODY_FONTS).nullable(),
 });
 
 const noteProseHexColor = z.string().regex(/^#[0-9a-f]{6}$/i);
@@ -405,7 +460,8 @@ const noteProseCustomColorSetSchema = z.object({
 export const NoteProseUpdateSchema = z.object({
   fontSize: z.union([z.literal(14), z.literal(16), z.literal(18), z.literal(20)]).nullable().optional(),
   lineHeight: z.union([z.literal(1.5), z.literal(1.65), z.literal(2)]).nullable().optional(),
-  palette: z.enum(NOTE_PROSE_PALETTE_CHOICES).nullable().optional(),
+  palette: z.union([z.enum(NOTE_PROSE_PALETTE_CHOICES), z.literal("orange")])
+    .transform((value) => value === "orange" ? "clay" as const : value).nullable().optional(),
   customCss: z.string().refine((value) => new TextEncoder().encode(value).byteLength <= MAX_NOTE_PROSE_CSS_BYTES).nullable().optional(),
   customColors: z.object({
     light: noteProseCustomColorSetSchema,

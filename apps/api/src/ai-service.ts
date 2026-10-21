@@ -1,13 +1,16 @@
 import type {
   AiAction,
   AiAttachmentInput,
-  AiDiscoveredModel,
   AiGenerationResultBoundary,
   AiModelConfig,
   AiPreparedGeneration,
   AiProvider,
   AiProviderConfig,
   AiSettings,
+  AiTranscriptionModel,
+  AiTranscriptionProvider,
+  AiTranscriptionStandard,
+  AiTranscriptionSettings,
   AiTargetLanguage,
   AiTone,
 } from "@edgeever/shared";
@@ -224,19 +227,195 @@ export const getAiSettings = async (
 
 export const normalizeAiBaseUrl = (value: string) => value.trim().replace(/\/+$/, "");
 
-const loadAiRuntime = () => import("./ai-runtime");
+export type AiTranscriptionProviderRow = {
+  id: string;
+  workspace_id: string;
+  provider: AiTranscriptionStandard;
+  display_name: string;
+  base_url: string;
+  api_key_encrypted: string;
+  is_enabled: number;
+  created_at: string;
+  updated_at: string;
+};
 
-export const createAiModel = async (config: {
-  provider: AiProvider;
-  baseUrl: string;
-  apiKey: string;
-  modelId: string;
-}) => {
-  const runtime = await loadAiRuntime();
-  return runtime.createAiModel({
-    ...config,
-    baseUrl: normalizeAiBaseUrl(config.baseUrl),
-  });
+export type AiTranscriptionModelRow = {
+  id: string;
+  provider_id: string;
+  model_id: string;
+  display_name: string;
+  created_at: string;
+  updated_at: string;
+};
+
+const selectTranscriptionProviderSql = `SELECT
+  id, workspace_id, provider, display_name, base_url, api_key_encrypted, is_enabled, created_at, updated_at
+  FROM ai_transcription_providers`;
+
+const selectTranscriptionModelSql = `SELECT
+  id, provider_id, model_id, display_name, created_at, updated_at
+  FROM ai_transcription_models`;
+
+export const getAiTranscriptionProvider = (
+  db: DatabaseAdapter,
+  workspaceId: string,
+  providerId: string,
+) => db.prepare(
+  `${selectTranscriptionProviderSql} WHERE id = ? AND workspace_id = ? LIMIT 1`,
+).bind(providerId, workspaceId).first<AiTranscriptionProviderRow>();
+
+export const getAiTranscriptionModel = (
+  db: DatabaseAdapter,
+  workspaceId: string,
+  modelConfigId: string,
+) => db.prepare(
+  `${selectTranscriptionModelSql}
+   WHERE id = ? AND provider_id IN (
+     SELECT id FROM ai_transcription_providers WHERE workspace_id = ?
+   )
+   LIMIT 1`,
+).bind(modelConfigId, workspaceId).first<AiTranscriptionModelRow>();
+
+export const getDefaultAiTranscriptionModelId = async (db: DatabaseAdapter, workspaceId: string) => {
+  const row = await db.prepare(
+    `SELECT default_model_id
+     FROM ai_transcription_workspace_settings
+     WHERE workspace_id = ?
+     LIMIT 1`,
+  ).bind(workspaceId).first<{ default_model_id: string | null }>();
+  return row?.default_model_id ?? null;
+};
+
+export const aiTranscriptionDefaultStatement = (
+  db: DatabaseAdapter,
+  workspaceId: string,
+  modelConfigId: string | null,
+  now: string,
+) => db.prepare(
+  `INSERT INTO ai_transcription_workspace_settings (
+     workspace_id, default_model_id, created_at, updated_at
+   ) VALUES (?, ?, ?, ?)
+   ON CONFLICT(workspace_id) DO UPDATE SET
+     default_model_id = excluded.default_model_id,
+     updated_at = excluded.updated_at`,
+).bind(workspaceId, modelConfigId, now, now);
+
+const mapAiTranscriptionModel = (row: AiTranscriptionModelRow): AiTranscriptionModel => ({
+  id: row.id,
+  providerId: row.provider_id,
+  modelId: row.model_id,
+  displayName: row.display_name,
+});
+
+const mapAiTranscriptionProvider = (
+  row: AiTranscriptionProviderRow,
+  models: AiTranscriptionModelRow[],
+  credentialsUnavailable = false,
+): AiTranscriptionProvider => ({
+  id: row.id,
+  provider: row.provider,
+  displayName: row.display_name,
+  baseUrl: row.base_url,
+  isEnabled: Boolean(row.is_enabled),
+  hasApiKey: Boolean(row.api_key_encrypted),
+  models: models.filter((model) => model.provider_id === row.id).map(mapAiTranscriptionModel),
+  ...(credentialsUnavailable ? { credentialsUnavailable: true } : {}),
+});
+
+const withAiTranscriptionCredentialAvailability = async (
+  row: AiTranscriptionProviderRow,
+  models: AiTranscriptionModelRow[],
+  encryptionConfigured: boolean,
+  environment?: AiCredentialEnvironment,
+): Promise<AiTranscriptionProvider> => {
+  const mapped = mapAiTranscriptionProvider(row, models);
+  if (!encryptionConfigured || !environment || !row.api_key_encrypted) return mapped;
+  try {
+    await decryptAiCredential(row.api_key_encrypted, environment);
+    return mapped;
+  } catch {
+    return mapAiTranscriptionProvider(row, models, true);
+  }
+};
+
+export const getAiTranscriptionSettings = async (
+  db: DatabaseAdapter,
+  workspaceId: string,
+  encryptionConfigured: boolean,
+  readOnly: boolean,
+  environment?: AiCredentialEnvironment,
+): Promise<AiTranscriptionSettings> => {
+  const [providersResult, modelsResult, defaultModelId] = await Promise.all([
+    db.prepare(
+      `${selectTranscriptionProviderSql} WHERE workspace_id = ? ORDER BY created_at ASC, id ASC`,
+    ).bind(workspaceId).all<AiTranscriptionProviderRow>(),
+    db.prepare(
+      `${selectTranscriptionModelSql}
+       WHERE provider_id IN (
+         SELECT id FROM ai_transcription_providers WHERE workspace_id = ?
+       )
+       ORDER BY created_at ASC, id ASC`,
+    ).bind(workspaceId).all<AiTranscriptionModelRow>(),
+    getDefaultAiTranscriptionModelId(db, workspaceId),
+  ]);
+  const providers = await Promise.all(providersResult.results.map((provider) =>
+    withAiTranscriptionCredentialAvailability(provider, modelsResult.results, encryptionConfigured, environment)));
+  const defaultProvider = providers.find((provider) =>
+    provider.models.some((model) => model.id === defaultModelId));
+  const enabled = Boolean(
+    encryptionConfigured
+    && defaultProvider?.isEnabled
+    && defaultProvider.hasApiKey
+    && !defaultProvider.credentialsUnavailable
+    && defaultProvider.models.some((model) => model.id === defaultModelId && model.modelId),
+  );
+  return {
+    providers,
+    defaultModelId,
+    enabled,
+    encryptionConfigured,
+    readOnly,
+  };
+};
+
+export const prepareAiTranscriptionCredentials = async (
+  db: DatabaseAdapter,
+  workspaceId: string,
+  environment: AiCredentialEnvironment,
+) => {
+  const row = await db.prepare(
+    `SELECT
+       models.model_id,
+       providers.provider,
+       providers.base_url,
+       providers.api_key_encrypted
+     FROM ai_transcription_workspace_settings AS settings
+     JOIN ai_transcription_models AS models ON models.id = settings.default_model_id
+     JOIN ai_transcription_providers AS providers ON providers.id = models.provider_id
+     WHERE settings.workspace_id = ?
+       AND providers.workspace_id = ?
+       AND providers.is_enabled = 1
+     LIMIT 1`,
+  ).bind(workspaceId, workspaceId).first<{
+    model_id: string;
+    provider: AiTranscriptionStandard;
+    base_url: string;
+    api_key_encrypted: string;
+  }>();
+  if (!row?.base_url || !row.model_id || !row.api_key_encrypted || !row.provider) {
+    return { enabled: false as const };
+  }
+  try {
+    return {
+      enabled: true as const,
+      provider: row.provider,
+      baseUrl: normalizeAiBaseUrl(row.base_url),
+      modelId: row.model_id,
+      apiKey: await decryptAiCredential(row.api_key_encrypted, environment),
+    };
+  } catch {
+    return { enabled: false as const };
+  }
 };
 
 export const loadDefaultAiModelCredentials = async (
@@ -280,12 +459,6 @@ export const loadDefaultAiModelCredentials = async (
   };
 };
 
-export const loadDefaultAiModel = async (
-  db: DatabaseAdapter,
-  workspaceId: string,
-  environment: AiCredentialEnvironment,
-) => createAiModel(await loadDefaultAiModelCredentials(db, workspaceId, environment));
-
 export const getDefaultAiDirectTarget = async (
   db: DatabaseAdapter,
   workspaceId: string,
@@ -297,93 +470,6 @@ export const getDefaultAiDirectTarget = async (
     baseUrl: credentials.baseUrl,
     modelId: credentials.modelId,
   };
-};
-
-type AiModelDiscoveryFetch = typeof fetch;
-
-const asRecord = (value: unknown): Record<string, unknown> | null =>
-  value && typeof value === "object" ? value as Record<string, unknown> : null;
-
-export const discoverAiModels = async (
-  config: {
-    provider: AiProvider;
-    baseUrl: string;
-    apiKey: string;
-  },
-  fetchImpl: AiModelDiscoveryFetch = fetch,
-): Promise<AiDiscoveredModel[]> => {
-  const url = `${normalizeAiBaseUrl(config.baseUrl)}/models`;
-  const headers = new Headers({ Accept: "application/json" });
-  if (config.provider === "anthropic") {
-    headers.set("x-api-key", config.apiKey);
-    headers.set("anthropic-version", "2023-06-01");
-  } else if (config.provider === "google") {
-    headers.set("x-goog-api-key", config.apiKey);
-  } else {
-    headers.set("Authorization", `Bearer ${config.apiKey}`);
-  }
-
-  const response = await fetchImpl(url, {
-    headers,
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (!response.ok) {
-    throw new AppError(
-      "ai_model_discovery_failed",
-      `The model list endpoint responded with HTTP ${response.status}.`,
-      400,
-    );
-  }
-
-  const body = asRecord(await response.json());
-  const rawModels = Array.isArray(body?.data)
-    ? body.data
-    : Array.isArray(body?.models)
-      ? body.models
-      : [];
-  const discovered = new Map<string, AiDiscoveredModel>();
-
-  for (const item of rawModels.slice(0, 2_000)) {
-    const record = asRecord(item);
-    if (!record) continue;
-    const rawId = typeof record.id === "string"
-      ? record.id
-      : typeof record.name === "string"
-        ? record.name
-        : "";
-    const modelId = config.provider === "google" ? rawId.replace(/^models\//, "") : rawId;
-    if (!modelId || discovered.has(modelId)) continue;
-    const displayName = typeof record.display_name === "string"
-      ? record.display_name
-      : typeof record.displayName === "string"
-        ? record.displayName
-        : typeof record.name === "string" && config.provider !== "google"
-          ? record.name
-          : modelId;
-    discovered.set(modelId, { modelId, displayName });
-  }
-
-  return Array.from(discovered.values()).sort((left, right) =>
-    left.displayName.localeCompare(right.displayName));
-};
-
-export const testAiModel = async (config: {
-  provider: AiProvider;
-  baseUrl: string;
-  apiKey: string;
-  modelId: string;
-}) => {
-  const runtime = await loadAiRuntime();
-  return runtime.generateAiText({
-    model: runtime.createAiModel({
-      ...config,
-      baseUrl: normalizeAiBaseUrl(config.baseUrl),
-    }),
-    system: "You are responding to an API connectivity check. Follow the user instruction exactly.",
-    prompt: "Reply with only: OK",
-    maxOutputTokens: 16,
-    abortSignal: AbortSignal.timeout(20_000),
-  });
 };
 
 /**
@@ -458,19 +544,6 @@ export const buildAiGenerationPrompt = (input: {
   input.instruction ? `User instruction (highest priority):\n${input.instruction}` : undefined,
 ].filter(Boolean).join("\n\n");
 
-type AiGenerationRequest = {
-  model: Awaited<ReturnType<typeof createAiModel>>;
-  action: AiAction;
-  title: string;
-  contentMarkdown: string;
-  targetLanguage?: AiTargetLanguage;
-  tone?: AiTone;
-  instruction?: string;
-  attachments?: AiAttachmentInput[];
-  resultBoundary: AiGenerationResultBoundary;
-  abortSignal?: AbortSignal;
-};
-
 const decodeBase64Text = (base64Data: string) => {
   const binary = atob(base64Data);
   const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
@@ -498,24 +571,6 @@ export const buildAiGenerationMessages = (
     });
   }
   return [{ role: "user", content }];
-};
-
-const buildAiGenerationRequest = (input: AiGenerationRequest) => {
-  const prompt = buildAiGenerationPrompt({
-    contentMarkdown: input.contentMarkdown,
-    targetLanguage: input.targetLanguage,
-    tone: input.tone,
-    instruction: input.instruction,
-  });
-  const common = {
-    model: input.model,
-    system: resolveAiGenerationSystemInstruction(input),
-    maxOutputTokens: AI_GENERATION_MAX_OUTPUT_TOKENS,
-    abortSignal: input.abortSignal,
-  };
-  return input.attachments?.length
-    ? { ...common, messages: buildAiGenerationMessages(prompt, input.attachments) }
-    : { ...common, prompt };
 };
 
 export const prepareAiGeneration = (input: {
@@ -546,28 +601,4 @@ export const prepareAiGeneration = (input: {
     maxOutputTokens: AI_GENERATION_MAX_OUTPUT_TOKENS,
     resultBoundary,
   };
-};
-
-export const generateAiGeneration = async (input: AiGenerationRequest) => {
-  const runtime = await loadAiRuntime();
-  return runtime.generateAiText(buildAiGenerationRequest(input));
-};
-
-export const streamAiGeneration = async (input: AiGenerationRequest) => {
-  const runtime = await loadAiRuntime();
-  return runtime.streamAiText(buildAiGenerationRequest(input));
-};
-
-export const generateAiTagSuggestions = async (input: {
-  model: Awaited<ReturnType<typeof createAiModel>>;
-  instruction: string;
-  title: string;
-  contentMarkdown: string;
-  currentTags: string[];
-  existingTags: string[];
-  locale?: string;
-  abortSignal?: AbortSignal;
-}) => {
-  const runtime = await loadAiRuntime();
-  return runtime.generateAiTagSuggestionNames(input);
 };

@@ -4,7 +4,7 @@ import {
   type EdgeEverClientRequestContext,
 } from "@edgeever/client";
 import type { AuthSession } from "@edgeever/shared";
-import { normalizeInstanceUrl } from "@edgeever/shared";
+import { normalizeInstanceUrl } from "@edgeever/shared/public-demo";
 import { createClientUuid } from "./client-id";
 
 export { ApiRequestError };
@@ -234,6 +234,7 @@ const toUint8Array = (bytes: ArrayBuffer | Uint8Array | undefined) => {
 };
 
 const desktopProviderFetch: typeof fetch = async (input, init) => {
+  init?.signal?.throwIfAborted();
   const bridge = window.edgeeverDesktop;
   if (!bridge?.openAiProviderStream || !bridge.onAiProviderStreamChunk) {
     throw new TypeError("Desktop AI transport is unavailable.");
@@ -247,9 +248,17 @@ const desktopProviderFetch: typeof fetch = async (input, init) => {
   new Headers(init?.headers).forEach((value, key) => {
     headers[key] = value;
   });
+  let bodyBytes: Uint8Array | undefined;
+  if (init?.body instanceof FormData) {
+    const multipart = new Request(url, { method: init.method ?? "POST", headers, body: init.body });
+    multipart.headers.forEach((value, key) => { headers[key] = value; });
+    bodyBytes = new Uint8Array(await multipart.arrayBuffer());
+  }
+  init?.signal?.throwIfAborted();
   const requestId = crypto.randomUUID();
   const pending: Array<{ type: "data" | "end" | "error"; bytes?: ArrayBuffer | Uint8Array; message?: string }> = [];
   let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let cleanup = () => {};
   const stop = bridge.onAiProviderStreamChunk((id, chunk) => {
     if (id !== requestId) return;
     if (!streamController) {
@@ -257,12 +266,22 @@ const desktopProviderFetch: typeof fetch = async (input, init) => {
       return;
     }
     if (chunk.type === "data") streamController.enqueue(toUint8Array(chunk.bytes));
-    else if (chunk.type === "end") streamController.close();
-    else streamController.error(new Error(chunk.message || "AI provider request failed."));
+    else {
+      if (chunk.type === "end") streamController.close();
+      else streamController.error(new Error(chunk.message || "AI provider request failed."));
+      cleanup();
+    }
   });
   const abort = () => {
     bridge.cancelAiProviderStream(requestId);
+    const reason = init?.signal?.reason ?? new DOMException("The operation was aborted.", "AbortError");
+    if (streamController) streamController.error(reason);
+    else pending.push({ type: "error", message: String(reason) });
+    cleanup();
+  };
+  cleanup = () => {
     stop();
+    init?.signal?.removeEventListener("abort", abort);
   };
   init?.signal?.addEventListener("abort", abort, { once: true });
   try {
@@ -271,14 +290,20 @@ const desktopProviderFetch: typeof fetch = async (input, init) => {
       method: init?.method,
       headers,
       body: typeof init?.body === "string" ? init.body : "",
+      ...(bodyBytes ? { bodyBytes } : {}),
     });
+    init?.signal?.throwIfAborted();
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         streamController = controller;
         for (const chunk of pending) {
           if (chunk.type === "data") controller.enqueue(toUint8Array(chunk.bytes));
-          else if (chunk.type === "end") controller.close();
-          else controller.error(new Error(chunk.message || "AI provider request failed."));
+          else {
+            if (chunk.type === "end") controller.close();
+            else controller.error(new Error(chunk.message || "AI provider request failed."));
+            cleanup();
+            break;
+          }
         }
         pending.length = 0;
       },
@@ -288,7 +313,7 @@ const desktopProviderFetch: typeof fetch = async (input, init) => {
     });
     return new Response(body, { status: opened.status, headers: opened.headers });
   } catch (error) {
-    stop();
+    cleanup();
     throw error;
   }
 };
@@ -298,6 +323,10 @@ const desktopAiDirectEnabled = Boolean(
   || (typeof window !== "undefined" && window.edgeeverDesktop?.openAiProviderStream),
 );
 
+/** Native clients connect directly; Web can relay initial network/CORS failures. */
+export const directProviderFetch: typeof fetch = (input, init) =>
+  client.fetchAiProvider(input, init);
+
 const client = createEdgeEverClient({
   baseUrl: getConfiguredDesktopApiBaseUrl,
   token: getDesktopSessionToken,
@@ -305,7 +334,7 @@ const client = createEdgeEverClient({
   shouldAttachToken: (path) => path !== "/api/v1/auth/login",
   onUnauthorized: handleUnauthorized,
   directAiGeneration: desktopAiDirectEnabled,
-  tryDirectAiGeneration: !desktopAiDirectEnabled,
+  allowAiServerFallback: !desktopAiDirectEnabled,
   providerFetch: desktopAiDirectEnabled ? desktopProviderFetch : undefined,
 });
 
@@ -327,7 +356,7 @@ export const api = {
     return session;
   },
 
-  login: async (payload: { username: string; password: string }) => {
+  login: async (payload: { username: string; password: string; locale?: string }) => {
     const session = await client.login({ ...payload, deviceId: getOrCreateClientDeviceId() });
     desktopSessionRejected = false;
     return session;
